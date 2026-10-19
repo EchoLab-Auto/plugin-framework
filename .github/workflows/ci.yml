@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # 与 workspace Cargo.toml 的 rust-version 保持一致。
+  RUST_VERSION: "1.98"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式
+        run: cargo fmt --all --check
+
+      - name: 编译（全部 target）
+        run: cargo build --workspace --all-targets --locked
+
+      - name: 测试
+        run: cargo test --workspace --locked
+
+      # clippy 只作为警告展示，不阻断（迁出期先让 CI 稳定；M4 收紧为 -D warnings）
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        continue-on-error: true

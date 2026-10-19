@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/echo-plugin-api",
+    "crates/echo-plugin-sdk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/EchoLab-Auto/plugin-framework"
+
+# 与 EchoAgentCore 根 Cargo.toml 保持同版本口径（迁出期同步，避免行为漂移）。
+# 六件套齐备（M3）后本仓独立演进，届时此处不再需要与 Core 对齐。
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# error handling
+thiserror = "2"
+
+# logging
+tracing = "0.1"
+
+# misc
+async-trait = "0.1"
+
+# 本仓内部 crate
+echo-plugin-api = { path = "crates/echo-plugin-api" }
