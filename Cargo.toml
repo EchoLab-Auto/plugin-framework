@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/echo-plugin-api",
     "crates/echo-plugin-sdk",
+    # 仓库自守门禁（只含 tests/，审计跨 crate 的仓库属性）
+    "crates/framework-gates",
 ]
 
 [workspace.package]

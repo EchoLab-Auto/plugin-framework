@@ -1,0 +1,12 @@
+[package]
+name = "framework-gates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "仓库自守门禁：框架不反向依赖宿主、库内零全局态（仅测试，无导出）"
+
+# 刻意不依赖任何 crate：门禁读的是磁盘上的 Cargo.toml 与源码文本，
+# 一旦它自己依赖了框架 crate，就失去了"独立审计"的意义。
+[dependencies]
