@@ -633,8 +633,25 @@ impl PluginRegistry {
         &self,
         context: &serde_json::Value,
     ) -> Vec<(crate::PluginTextBlock, String)> {
+        self.collect_text_blocks_filtered(context, |_| true)
+    }
+
+    /// 同 [`Self::collect_text_blocks`]，但按插件 id 过滤。
+    ///
+    /// 为什么需要过滤：宿主的"这个使用者能看什么"是**按使用者**决定的（宿主
+    /// 里的白名单/授权），而插件挂载是**进程级**的。一次装配要能只取某些插件
+    /// 贡献的块——框架只提供"按 id 过滤"这个钩子，判断逻辑完全归宿主（框架
+    /// 不认识白名单是什么）。
+    pub fn collect_text_blocks_filtered(
+        &self,
+        context: &serde_json::Value,
+        keep: impl Fn(&str) -> bool,
+    ) -> Vec<(crate::PluginTextBlock, String)> {
         let mut out: Vec<(crate::PluginTextBlock, String)> = Vec::new();
         for id in self.mounted_ids() {
+            if !keep(&id) {
+                continue;
+            }
             let Some(plugin) = self.plugin(&id) else {
                 continue;
             };
@@ -1824,5 +1841,43 @@ mod command_text_block_tests {
         let d = &reg.descriptors()[0];
         assert_eq!(d.handled_commands, vec!["A".to_string(), "B".to_string()]);
         assert_eq!(d.text_blocks, vec!["k1".to_string(), "k2".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod text_block_filter_tests {
+    use super::*;
+    use crate::manifest::PluginManifest;
+    use std::sync::Arc;
+
+    fn plugin(id: &'static str, key: &'static str) -> Arc<dyn Plugin> {
+        Arc::new(
+            crate::plugin::BuiltinPlugin::new(
+                PluginManifest::builtin(id, id, "1", "tool", "", ""),
+                |_| Ok(vec![]),
+            )
+            .with_text_blocks([crate::PluginTextBlock::new(key, key, 0)])
+            .with_text_block_content(move |_, _| Some(format!("from {id}"))),
+        )
+    }
+
+    /// 过滤钩子只取留下的那些插件贡献的块（宿主按使用者做判断）。
+    #[test]
+    fn filter_keeps_only_selected_plugins() {
+        let reg = PluginRegistry::new();
+        reg.register(plugin("tb.a", "a")).unwrap();
+        reg.register(plugin("tb.b", "b")).unwrap();
+        reg.mount_all(&MountContext::new());
+
+        let all = reg.collect_text_blocks(&serde_json::Value::Null);
+        assert_eq!(all.len(), 2, "不过滤 = 全要");
+
+        let only_b = reg.collect_text_blocks_filtered(&serde_json::Value::Null, |id| id == "tb.b");
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].0.key, "b");
+        assert_eq!(only_b[0].1, "from tb.b");
+
+        let none = reg.collect_text_blocks_filtered(&serde_json::Value::Null, |_| false);
+        assert!(none.is_empty(), "全否 = 空");
     }
 }
