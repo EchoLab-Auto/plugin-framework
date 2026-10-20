@@ -22,9 +22,11 @@
 声明）+ `mount_when_ready`（先等后挂）+ `reconcile`（依赖变更 → 重挂/卸下）+
 `PluginScope` / `MountContext::nest`（插件树：父插件宿主化子插件，卸载级联、
 子作用域遮蔽父服务）。对应 dsh 的 `inject` / `ctx.plugin()` / `ctx.isolate()`。
+事件双向通道（v0.7.0）：插件侧 `MountContext::emit`、宿主侧
+`Plugin::subscribed_events` / `on_event` + `PluginRegistry::deliver_event`。
 
 ```bash
-cargo test --workspace   # 188 项
+cargo test --workspace   # 195 项
 ```
 
 **它能被别的应用用吗？** 这是唯一有意义的问题，所以有一个可执行的证伪测试：

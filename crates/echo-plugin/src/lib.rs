@@ -12,11 +12,13 @@
 //!   applies to data plugins (skills/tools/manifests); code plugins reload
 //!   via atomic binary replacement + process restart (the self-update path).
 
+pub mod event;
 pub mod manifest;
 pub mod plugin;
 pub mod registry;
 pub mod scope;
 
+pub use event::{EventSink, PluginEvent, ALL_EVENTS};
 pub use manifest::{PluginError, PluginManifest, PluginRuntime};
 pub use plugin::{
     BuiltinPlugin, Inject, MountContext, Plugin, PluginMountError, PluginMountResult,

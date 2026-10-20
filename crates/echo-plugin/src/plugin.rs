@@ -43,6 +43,14 @@ pub struct MountContext {
     /// 这是 dsh `ctx.plugin()` 嵌套的对应物；**框架不认识"子插件"这个业务
     /// 概念**，只认"作用域归属"这一层结构。
     pub tree: Option<Arc<crate::PluginScope>>,
+    /// 本插件的 id（宿主在挂载时填；[`MountContext::emit`] 用它做来源标记）。
+    ///
+    /// 没填时为空串——裸 `PluginRegistry` 的测试用法可以不管它。
+    pub plugin_id: String,
+    /// 事件出口（宿主注入；`None` = 没有接收方，[`MountContext::emit`] 丢弃）。
+    ///
+    /// 与子进程轨的 `Emit` 帧同语义：同步、即发即走、无返回值。
+    pub events: Option<crate::EventSink>,
 }
 
 impl MountContext {
@@ -78,6 +86,26 @@ impl MountContext {
     pub fn tree(&self) -> Option<&Arc<crate::PluginScope>> {
         self.tree.as_ref()
     }
+    /// 发一条事件给宿主（`None` 出口 = 静默丢弃，不算错误）。
+    ///
+    /// 名字与载荷都归宿主与插件自行约定；框架只搬。**不要在 `mount` 之外
+    /// 依赖它一定送达**：出口是宿主的实现细节（面板没连、事件总线正忙时
+    /// 都可能丢），要可靠通知请走命令回执。
+    pub fn emit(&self, name: impl Into<String>, payload: serde_json::Value) {
+        if let Some(sink) = &self.events {
+            sink(crate::PluginEvent::new(
+                self.plugin_id.clone(),
+                name,
+                payload,
+            ));
+        }
+    }
+
+    /// 本插件的 id（裸用法下为空串）。
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
     /// 为**本插件**建一个子作用域（子插件挂这里）；无树可用时 `None`。
     ///
     /// 只在 `mount` 期间有效（作用域要知道当前挂载的是谁，才能把子作用域
@@ -211,6 +239,26 @@ pub trait Plugin: Send + Sync {
         Inject::default()
     }
 
+    /// 本插件想订阅的**事件名**（默认空 = 不订阅）。
+    ///
+    /// 与协议里 `Contribution::Events { subscribe }` 同义。`["*"]`（
+    /// [`crate::ALL_EVENTS`]）表示全收。宿主经
+    /// [`PluginRegistry::deliver_event`] 按名分发，只有声明过的才会收到。
+    ///
+    /// [`PluginRegistry::deliver_event`]: crate::PluginRegistry::deliver_event
+    fn subscribed_events(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// 收到一条订阅过的事件（默认忽略）。
+    ///
+    /// 返回 `Err` 表示"这条我没处理成"：宿主会把它计数成投递失败，**不会**
+    /// 卸载插件（事件是观察通道，不是控制通道）。
+    fn on_event(&self, event: &crate::PluginEvent) -> Result<(), String> {
+        let _ = event;
+        Ok(())
+    }
+
     /// 硬依赖的键（[`Self::inject`] 的便捷读法：`self.inject().required`）。
     ///
     /// 保留它是**兼容 v0.5.0 的接缝**：那一版只有 `required_services`，
@@ -226,7 +274,15 @@ pub struct BuiltinPlugin {
     manifest: PluginManifest,
     mount_fn: Box<dyn Fn(&MountContext) -> PluginMountResult + Send + Sync>,
     inject: Inject,
+    subscriptions: Vec<String>,
+    event_handler: Option<EventHandler>,
 }
+
+/// 事件处理闭包（`BuiltinPlugin::with_event_handler` 的入参）。
+///
+/// 别名只为让字段声明可读（裸 `Option<Box<dyn Fn(..) -> Result<..>>>` 会被
+/// clippy 判"类型过于复杂"）。
+type EventHandler = Box<dyn Fn(&crate::PluginEvent) -> Result<(), String> + Send + Sync>;
 
 impl BuiltinPlugin {
     pub fn new(
@@ -237,7 +293,28 @@ impl BuiltinPlugin {
             manifest,
             mount_fn: Box::new(mount_fn),
             inject: Inject::default(),
+            subscriptions: Vec::new(),
+            event_handler: None,
         }
+    }
+
+    /// 声明订阅的事件名（见 [`Plugin::subscribed_events`]）。
+    pub fn with_subscriptions<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.subscriptions = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// 附带事件处理闭包（见 [`Plugin::on_event`]）。
+    pub fn with_event_handler(
+        mut self,
+        f: impl Fn(&crate::PluginEvent) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.event_handler = Some(Box::new(f));
+        self
     }
 
     /// 声明本插件的依赖（见 [`Plugin::inject`]）：硬依赖 + 可选软依赖。
@@ -268,5 +345,16 @@ impl Plugin for BuiltinPlugin {
 
     fn inject(&self) -> Inject {
         self.inject.clone()
+    }
+
+    fn subscribed_events(&self) -> Vec<String> {
+        self.subscriptions.clone()
+    }
+
+    fn on_event(&self, event: &crate::PluginEvent) -> Result<(), String> {
+        match &self.event_handler {
+            Some(handler) => handler(event),
+            None => Ok(()),
+        }
     }
 }

@@ -4,6 +4,37 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.7.0] — 2026-11-01
+
+补上 `Contribution::Events` 的**进程内**那一半——它一直"声明了没人读"
+（SDK 的 `serve` 里 `Contribution::Events(_) => None`，宿主零消费）。
+
+### 新增
+
+- `PluginEvent { plugin, name, payload }`：一条插件事件。`plugin` 由**宿主**
+  填充（注册表在挂载时把 id 注入上下文），插件自己 emit 时不必知道 id。
+- 插件 → 宿主：`MountContext.events: Option<EventSink>` + `MountContext::emit`。
+  **没有出口 = 静默丢弃**（降级不是错误）——单测与无 Panel 的部署不需要它。
+- 宿主 → 插件：`Plugin::subscribed_events()`（默认空）+ `Plugin::on_event()`
+  （默认 `Ok`）+ `PluginRegistry::deliver_event()`（按名分发，`"*"` =
+  `ALL_EVENTS` 全收）。**只投给已挂载的插件**（未挂载不该有副作用，同款原则）；
+  `on_event` 返回 `Err` 只计数不卸载——事件是观察通道，不是控制通道。
+- `BuiltinPlugin::with_subscriptions` / `with_event_handler`。
+- `MountContext.plugin_id`：本插件的 id（顺带让插件能自己打带 id 的日志）。
+- 注册表自己在挂/卸时发 `plugin.mounted` / `plugin.unmounted`（带 `id` /
+  `depth`）——插件树的变化因此可观测。
+- `PluginScope` 的子作用域**继承事件出口**：整棵树汇到同一接收方，靠 `depth`
+  区分来源。
+- `PluginDescriptor.subscribed_events`：面板能回答「这个插件会对什么有反应」。
+
+### 为什么 emit 走 `MountContext` 而不是 trait 方法
+
+`emit` 是**挂载期之后也要能用**的能力（插件在运行期随时通知宿主），而
+`Plugin` 的 trait 方法拿不到 `MountContext`。把 sink 塞进上下文、让插件在
+`mount` 里存一份（`Arc<dyn Fn>` 可克隆），与协议里 `Emit` 帧的
+"即发即走、无返回值"语义一致。`on_event` 走 trait 是因为它的调用方是宿主、
+时机是宿主决定的（推 vs 拉的分界）。
+
 ## [0.6.1] — 2026-11-01
 
 修 v0.6.0 的一个漏洞：**类型化 `provide` 不广播变更通知**。
@@ -13,6 +44,7 @@
 `reconcile`）看不到通过 `provide` 注册的服务。现在两条路径都走 `publish`。
 +1 测试（`typed_provide_broadcasts_like_register`）。
 
+[0.7.0]: #070--2026-11-01
 [0.6.1]: #061--2026-11-01
 
 ## [0.6.0] — 2026-11-01

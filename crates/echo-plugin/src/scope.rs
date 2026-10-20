@@ -140,6 +140,10 @@ impl PluginScope {
     }
 
     fn build(ctx: Arc<Ctx>, depth: usize) -> Arc<Self> {
+        Self::build_with_sink(ctx, depth, None)
+    }
+
+    fn build_with_sink(ctx: Arc<Ctx>, depth: usize, sink: Option<crate::EventSink>) -> Arc<Self> {
         let links = Arc::new(TreeLinks::default());
         let scope = Arc::new(Self {
             ctx,
@@ -150,6 +154,9 @@ impl PluginScope {
         // 注册表通过弱引用回指本作用域：卸载时据此级联卸子作用域。
         // 用 Weak 而不是 Arc——`scope → registry → scope` 成环会泄漏。
         scope.registry.attach_tree(Arc::downgrade(&scope));
+        if let Some(sink) = sink {
+            scope.registry.set_event_sink(sink);
+        }
         scope
     }
 
@@ -225,7 +232,10 @@ impl PluginScope {
     /// [`MountContext::nest`]: crate::MountContext::nest
     pub fn nest(self: &Arc<Self>) -> Option<Arc<PluginScope>> {
         let owner = self.links.current_owner()?;
-        let child = Self::build(self.ctx.child(), self.depth + 1);
+        // 子作用域**继承事件出口**：整棵树的事件汇到同一个接收方，
+        // 接收方靠 `depth` / `plugin` 区分来源。
+        let child =
+            Self::build_with_sink(self.ctx.child(), self.depth + 1, self.registry.event_sink());
         self.links.adopt(&owner, child.clone());
         Some(child)
     }
@@ -506,5 +516,37 @@ mod tests {
                 .any(|(key, depth)| key == "child-private" && *depth == 1),
             "根的订阅者应收到子作用域（depth=1）的注册: {provided:?}"
         );
+    }
+
+    /// 子作用域**继承事件出口**：整棵树的事件汇到同一接收方，靠 `depth` 区分。
+    #[test]
+    fn child_scope_inherits_the_event_sink() {
+        use std::sync::Mutex;
+        let seen: Arc<Mutex<Vec<crate::PluginEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        let root_ctx = Arc::new(Ctx::default());
+        let scope = PluginScope::root(root_ctx);
+        scope
+            .registry()
+            .set_event_sink(Arc::new(move |event| sink_seen.lock().unwrap().push(event)));
+
+        scope
+            .mount(parent_with_child(
+                "t.parent",
+                "t.child",
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ))
+            .expect("mount");
+
+        let events = seen.lock().unwrap().clone();
+        // 顶层与子作用域的挂载事件都应到达（子作用域带 depth 1）。
+        let child_mounted = events
+            .iter()
+            .find(|e| e.payload["id"] == "t.child")
+            .expect("子作用域的挂载事件应到达同一个出口");
+        assert_eq!(child_mounted.name, "plugin.mounted");
+        assert_eq!(child_mounted.payload["depth"], 1);
     }
 }

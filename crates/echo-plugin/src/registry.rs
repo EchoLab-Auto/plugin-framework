@@ -95,6 +95,11 @@ pub struct PluginDescriptor {
     /// ——依赖恢复后 [`PluginRegistry::reconcile`] 会把插件挂上并清空它。
     #[serde(default)]
     pub pending_services: Vec<String>,
+    /// 本插件订阅的事件名（`Contribution::Events` 的进程内等价物）。
+    ///
+    /// 空 = 不订阅。面板据此回答「这个插件会对什么有反应」。
+    #[serde(default)]
+    pub subscribed_events: Vec<String>,
 }
 
 /// 插件的**定义来源**（面板技术信息展示用）。
@@ -136,6 +141,7 @@ impl From<&PluginManifest> for PluginDescriptor {
             required_services: Vec::new(),
             optional_services: Vec::new(),
             pending_services: Vec::new(),
+            subscribed_events: Vec::new(),
         }
     }
 }
@@ -203,6 +209,12 @@ pub struct PluginRegistry {
     /// 用弱引用是为了不制造 `scope → registry → scope` 的 Arc 环：作用域
     /// 由调用方持有，注册表只借它做「归属记录 + 级联卸载」。
     tree: std::sync::Mutex<Option<std::sync::Weak<crate::PluginScope>>>,
+    /// 事件出口（宿主注入；`None` = 没有接收方）。
+    ///
+    /// 两处用它：① 挂载时包一层带本插件 id 的 sink 放进 `MountContext`，
+    /// 插件的 `emit` 因此不必知道自己的 id；② 挂/卸时由注册表自己发
+    /// `plugin.mounted` / `plugin.unmounted`（插件树的观测面）。
+    event_sink: std::sync::Mutex<Option<crate::EventSink>>,
     /// 因**依赖未就绪**而没挂上的插件 → 当时缺的键。
     ///
     /// 与 `enabled_state = false`（人主动禁用）区分开：这些是"该挂、还没
@@ -302,11 +314,13 @@ impl PluginRegistry {
                 available,
             });
         }
-        // 2) 本插件配置（未登记 = Null）+ 树把手（作用域归属）。
+        // 2) 本插件配置（未登记 = Null）+ 树把手（作用域归属）+ 事件出口。
         let plugin_ctx = MountContext {
             ctx: ctx.ctx.clone(),
             config: self.config_for(id),
             tree: ctx.tree.clone(),
+            plugin_id: id.to_string(),
+            events: self.sink_for_plugin(id),
         };
         // 3) 记录"当前正在挂载谁"：插件在 mount 里 `nest()` 出的子作用域
         //    据此记在它名下，卸载它时级联卸载（dsh 的 ctx.plugin 语义）。
@@ -322,6 +336,11 @@ impl PluginRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         active.insert(id.to_string(), disposers.into_iter().rev().collect());
         drop(active);
+        // 挂载成功 → 观测事件（插件树的变化因此可见）。
+        self.emit_host(
+            "plugin.mounted",
+            serde_json::json!({ "id": id, "depth": self.depth() }),
+        );
         self.clear_pending(id);
         self.set_plugin_error_cleared(id);
         Ok(Vec::new())
@@ -355,6 +374,10 @@ impl PluginRegistry {
             if let Some(plugin) = self.plugin(id) {
                 plugin.unmount()?;
             }
+            self.emit_host(
+                "plugin.unmounted",
+                serde_json::json!({ "id": id, "depth": self.depth() }),
+            );
         }
         Ok(())
     }
@@ -497,6 +520,79 @@ impl PluginRegistry {
             .iter()
             .map(|(id, keys)| (id.clone(), keys.clone()))
             .collect()
+    }
+
+    /// 注入**事件出口**（组合根装配期一次；子作用域建时自动继承）。
+    ///
+    /// 没有出口时一切 `emit` 都是静默丢弃——这是**降级而不是错误**：单测、
+    /// 无 Panel 的部署都不需要它。
+    pub fn set_event_sink(&self, sink: crate::EventSink) {
+        *self
+            .event_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+    }
+
+    /// 当前的出口（子作用域建时用来继承）。
+    pub fn event_sink(&self) -> Option<crate::EventSink> {
+        self.event_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// **宿主**发一条事件（`plugin` 留空，表示不是某个插件发的）。
+    pub fn emit_host(&self, name: &str, payload: serde_json::Value) {
+        if let Some(sink) = self.event_sink() {
+            sink(crate::PluginEvent::host(name, payload));
+        }
+    }
+
+    /// 把事件**投递给订阅了它的已挂载插件**，返回成功投递数。
+    ///
+    /// 订阅匹配：`subscribed_events()` 里含事件名，或含 [`crate::ALL_EVENTS`]。
+    /// 投递失败（插件 `on_event` 返回 `Err`）只计数不卸载——事件是观察通道。
+    ///
+    /// 只投给**已挂载**的插件：没挂载就没有副作用，也就不该收到事件
+    /// （与"禁用的插件不获得任何副作用"同一原则）。
+    pub fn deliver_event(&self, event: &crate::PluginEvent) -> usize {
+        let mut delivered = 0;
+        for id in self.mounted_ids() {
+            let Some(plugin) = self.plugin(&id) else {
+                continue;
+            };
+            let subscriptions = plugin.subscribed_events();
+            if subscriptions.is_empty() {
+                continue;
+            }
+            let wanted = subscriptions
+                .iter()
+                .any(|name| name == &event.name || name == crate::ALL_EVENTS);
+            if !wanted {
+                continue;
+            }
+            if plugin.on_event(event).is_ok() {
+                delivered += 1;
+            }
+        }
+        delivered
+    }
+
+    /// 本注册表距树根的深度（裸注册表 = 0）。
+    fn depth(&self) -> usize {
+        self.tree_handle().map(|scope| scope.depth()).unwrap_or(0)
+    }
+
+    /// 给某个插件包装一个"自动填 id"的出口。
+    fn sink_for_plugin(&self, id: &str) -> Option<crate::EventSink> {
+        let sink = self.event_sink()?;
+        let id = id.to_string();
+        Some(Arc::new(move |mut event: crate::PluginEvent| {
+            if event.plugin.is_empty() {
+                event.plugin = id.clone();
+            }
+            sink(event);
+        }))
     }
 
     /// 本注册表所属的树作用域（`PluginScope` 建时注入；裸注册表为 `None`）。
@@ -735,6 +831,7 @@ impl PluginRegistry {
                 d.required_services = inject.required.clone();
                 d.optional_services = inject.optional.clone();
                 d.pending_services = pending.get(&id).cloned().unwrap_or_default();
+                d.subscribed_events = p.subscribed_events();
                 if let Some(origin) = origins.get(&id) {
                     d.config_origin = origin.clone();
                 }
