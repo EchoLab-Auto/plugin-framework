@@ -206,6 +206,14 @@ impl Inject {
     }
 }
 
+/// 命令处理的 future（`Plugin::handle_command_async` 的返回项）。
+///
+/// 别名只为可读：裸写 `Option<Pin<Box<dyn Future<..> + Send + 'a>>>` 会被
+/// clippy 判"类型过于复杂"，而它出现在 trait 方法与实现两处。
+pub type CommandFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+>;
+
 /// 插件贡献的一块**有序文本**（宿主装配提示词/文档等"拼接型内容"时收集）。
 ///
 /// 框架不知道"提示词"是什么——它只知道"有一个键、一个标题、一段文本、一个
@@ -314,6 +322,24 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// 处理一条命令（**异步**入口，宿主实际调用这个）。
+    ///
+    /// 默认实现把同步版本包成 ready future——所以只实现 [`Self::handle_command`]
+    /// 的插件照常工作。命令处理里出现 IO（读盘 / `spawn_blocking` / 跨机查询）
+    /// 时覆写本方法。
+    ///
+    /// 为什么是 boxed future 而不是 `async fn`：插件以 `Arc<dyn Plugin>` 存在，
+    /// trait 必须对象安全，而原生 async trait 方法不是。`payload` 按值收是因为
+    /// future 不能借调用方的栈。
+    fn handle_command_async<'a>(
+        &'a self,
+        name: &'a str,
+        payload: serde_json::Value,
+    ) -> Option<CommandFuture<'a>> {
+        self.handle_command(name, &payload)
+            .map(|outcome| -> CommandFuture<'a> { Box::pin(async move { outcome }) })
+    }
+
     /// 本插件贡献的**文本块声明**（键 / 标题 / 顺序；默认空）。
     ///
     /// 只做声明、**不产生文本**——因此可以在任何时刻调用（面板列举、宿主
@@ -351,6 +377,7 @@ pub struct BuiltinPlugin {
     event_handler: Option<EventHandler>,
     commands: Vec<String>,
     command_handler: Option<CommandHandler>,
+    async_command_handler: Option<AsyncCommandHandler>,
     text_blocks: Option<TextBlockSource>,
     text_content: Option<TextContentSource>,
 }
@@ -366,6 +393,19 @@ type EventHandler = Box<dyn Fn(&crate::PluginEvent) -> Result<(), String> + Send
 /// 返回语义与 [`Plugin::handle_command`] 一致：`None` = 不认识，交给下一个。
 type CommandHandler = Box<
     dyn Fn(&str, &serde_json::Value) -> Option<Result<serde_json::Value, String>> + Send + Sync,
+>;
+
+/// 命令处理闭包（异步版；`BuiltinPlugin::with_command_handler_async` 的入参）。
+///
+/// 返回 boxed future 才能同时满足"trait 对象安全"与"处理里可以 await IO"。
+type AsyncCommandHandler = Box<
+    dyn Fn(
+            String,
+            serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
+        > + Send
+        + Sync,
 >;
 
 /// 提示词块声明来源（`BuiltinPlugin::with_text_blocks` 的入参）。
@@ -387,6 +427,7 @@ impl BuiltinPlugin {
             event_handler: None,
             commands: Vec::new(),
             command_handler: None,
+            async_command_handler: None,
             text_blocks: None,
             text_content: None,
         }
@@ -433,6 +474,24 @@ impl BuiltinPlugin {
             + 'static,
     ) -> Self {
         self.command_handler = Some(Box::new(f));
+        self
+    }
+
+    /// 附带**异步**命令处理闭包（需要 IO 的命令用这个）。
+    ///
+    /// 与 `with_command_handler` 二选一；都设时以本方法为准。
+    pub fn with_command_handler_async<F>(mut self, f: F) -> Self
+    where
+        F: Fn(
+                String,
+                serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
+            > + Send
+            + Sync
+            + 'static,
+    {
+        self.async_command_handler = Some(Box::new(f));
         self
     }
 
@@ -506,6 +565,19 @@ impl Plugin for BuiltinPlugin {
         payload: &serde_json::Value,
     ) -> Option<Result<serde_json::Value, String>> {
         self.command_handler.as_ref()?(name, payload)
+    }
+
+    fn handle_command_async<'a>(
+        &'a self,
+        name: &'a str,
+        payload: serde_json::Value,
+    ) -> Option<CommandFuture<'a>> {
+        if let Some(handler) = &self.async_command_handler {
+            let name = name.to_string();
+            return Some(handler(name, payload));
+        }
+        self.handle_command(name, &payload)
+            .map(|outcome| -> CommandFuture<'a> { Box::pin(async move { outcome }) })
     }
 
     fn text_blocks(&self) -> Vec<PluginTextBlock> {

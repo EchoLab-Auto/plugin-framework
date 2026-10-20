@@ -668,6 +668,35 @@ impl PluginRegistry {
         out
     }
 
+    /// **异步**分发一条命令（宿主实际入口；处理里可能要 await IO）。
+    ///
+    /// 语义与 [`Self::dispatch_command`] 完全一致，只是把插件侧改成
+    /// [`Plugin::handle_command_async`]——只实现了同步版本的插件照常工作
+    /// （默认实现把同步结果包成 ready future）。
+    ///
+    /// [`Plugin::handle_command_async`]: crate::Plugin::handle_command_async
+    pub async fn dispatch_command_async(
+        &self,
+        name: &str,
+        payload: serde_json::Value,
+    ) -> Option<Result<serde_json::Value, String>> {
+        for id in self.mounted_ids() {
+            let Some(plugin) = self.plugin(&id) else {
+                continue;
+            };
+            if !plugin.handled_commands().iter().any(|cmd| cmd == name) {
+                continue;
+            }
+            // 先把 future 取出来（不等它），再 await——否则 `if let` 里持有
+            // 的 `plugin` 借用会与 `&self` 的其他使用冲突。
+            let fut = plugin.handle_command_async(name, payload.clone());
+            if let Some(fut) = fut {
+                return Some(fut.await);
+            }
+        }
+        None
+    }
+
     /// 某条命令当前由谁处理（诊断/测试用；`None` = 无人处理）。
     pub fn command_owner(&self, name: &str) -> Option<String> {
         self.mounted_ids().into_iter().find(|id| {
@@ -1879,5 +1908,74 @@ mod text_block_filter_tests {
 
         let none = reg.collect_text_blocks_filtered(&serde_json::Value::Null, |_| false);
         assert!(none.is_empty(), "全否 = 空");
+    }
+}
+
+#[cfg(test)]
+mod async_command_tests {
+    use super::*;
+    use crate::manifest::PluginManifest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 异步处理真能 await（用 yield 让出一次执行权）。
+    #[tokio::test]
+    async fn async_handler_is_awaited() {
+        let reg = PluginRegistry::new();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let p = polls.clone();
+        reg.register(Arc::new(
+            crate::plugin::BuiltinPlugin::new(
+                PluginManifest::builtin("ac.a", "a", "1", "tool", "", ""),
+                |_| Ok(vec![]),
+            )
+            .with_commands(["Slow"])
+            .with_command_handler_async(move |name, payload| {
+                let p = p.clone();
+                Box::pin(async move {
+                    // 真的让出一次：证明宿主在 await，而不是拿到 ready future
+                    tokio::task::yield_now().await;
+                    p.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({ "name": name, "echo": payload }))
+                })
+            }),
+        ))
+        .unwrap();
+        reg.mount_all(&MountContext::new());
+
+        let out = reg
+            .dispatch_command_async("Slow", serde_json::json!({"n": 1}))
+            .await
+            .expect("有人处理")
+            .unwrap();
+        assert_eq!(out["name"], "Slow");
+        assert_eq!(out["echo"]["n"], 1);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 只实现同步版本的插件，走异步分发也能工作（默认实现委托）。
+    #[tokio::test]
+    async fn sync_only_plugin_works_through_async_dispatch() {
+        let reg = PluginRegistry::new();
+        reg.register(Arc::new(
+            crate::plugin::BuiltinPlugin::new(
+                PluginManifest::builtin("ac.b", "b", "1", "tool", "", ""),
+                |_| Ok(vec![]),
+            )
+            .with_commands(["Fast"])
+            .with_command_handler(|_, _| Some(Ok(serde_json::json!({"fast": true})))),
+        ))
+        .unwrap();
+        reg.mount_all(&MountContext::new());
+        let out = reg
+            .dispatch_command_async("Fast", serde_json::Value::Null)
+            .await
+            .expect("有人处理")
+            .unwrap();
+        assert_eq!(out["fast"], true);
+        // 未声明的名字仍然回到 None
+        assert!(reg
+            .dispatch_command_async("Nope", serde_json::Value::Null)
+            .await
+            .is_none());
     }
 }

@@ -4,6 +4,24 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.9.0] — 2026-11-01
+
+命令处理补上**异步入口**——v0.8 的 `handle_command` 是同步的，只能做"不等"的
+事；真实命令域里几乎每条都要 IO（读盘、`spawn_blocking`、跨机���询）。
+
+### 新增
+
+- `Plugin::handle_command_async(name, payload) -> Option<BoxFuture<'a, Result<Value, String>>>`
+  （默认把同步版本包成 ready future，所以只实现同步版的插件照常工作）；
+- `PluginRegistry::dispatch_command_async(name, payload)`：宿主实际入口；
+- `BuiltinPlugin::with_command_handler_async`。
+
+### 为什么用 boxed future 而不是 `async fn`
+
+插件以 `Arc<dyn Plugin>` 存在，trait 必须**对象安全**，而原生 `async fn` in
+trait 不是对象安全的（AFIT 目前不支持 `dyn`）。`payload` 按值收是因为 future
+不能借调用方的栈。
+
 ## [0.8.0] — 2026-11-01
 
 补上最后两类"声明了没人读"的贡献：**命令处理**与**有序文本块**。至此协议里
@@ -81,6 +99,7 @@
 `reconcile`）看不到通过 `provide` 注册的服务。现在两条路径都走 `publish`。
 +1 测试（`typed_provide_broadcasts_like_register`）。
 
+[0.9.0]: #090--2026-11-01
 [0.8.0]: #080--2026-11-01
 [0.7.0]: #070--2026-11-01
 [0.6.1]: #061--2026-11-01
