@@ -6,23 +6,30 @@
 框架部分，目标是「任何 Rust 应用都能拿它建一套插件系统」——框架不依赖任何应用
 领域词汇（没有 session / tool / llm 这类概念）。EchoAgent 只是它的第一个使用者。
 
-## 状态：**M1（进行中）**
+## 状态：六件套齐备（v0.2.0）
 
-迁移分六个里程碑，当前本仓只包含**两件套**：
+| crate | 作用 |
+|---|---|
+| [`echo-context`](./crates/echo-context) | **内核**：服务定位 `Ctx` + 强类型 `ServiceKey` + 四模式 `EventBus` + 可逆注册 `Disposer` + `ScopedRegistry` |
+| [`echo-plugin-api`](./crates/echo-plugin-api) | **冻结协议**：`Hello` / `Invoke` / `Register` / `Cancel` / `Drain` / `HostCall`；贡献类型；版本协商 |
+| [`echo-plugin-loader`](./crates/echo-plugin-loader) | 分层配置合成（profile → bundle → patch）+ provenance + 依赖排序 |
+| [`echo-plugin`](./crates/echo-plugin) | manifest + 生命周期 + registry（挂载/卸载/启停门控） |
+| [`echo-plugin-host`](./crates/echo-plugin-host) | **宿主角**：运输层（inproc / stdio）+ supervisor（握手/取消/排空/崩溃重启）+ conformance 套件 |
+| [`echo-plugin-sdk`](./crates/echo-plugin-sdk) | **插件侧运行时**：帧读写、握手、serve 循环、宿主回呼 |
+| [`framework-gates`](./crates/framework-gates) | 仓库自守门禁（不反向依赖宿主 / 零全局态 / 领域无关） |
 
-| crate | 作用 | 状态 |
-|---|---|---|
-| [`echo-plugin-api`](./crates/echo-plugin-api) | **冻结协议**：`Hello` / `Invoke` / `Register` / `Cancel` / `Drain` / `HostCall`；贡献类型；版本协商 | ✅ 已迁入 |
-| [`echo-plugin-sdk`](./crates/echo-plugin-sdk) | **插件侧运行时**：帧读写、握手、serve 循环、宿主回呼 | ✅ 已迁入 |
-| `echo-plugin` | manifest + 生命周期 + registry | ⏳ M3 |
-| `echo-plugin-loader` | 分层配置合成（profile → bundle → patch） | ⏳ M3 |
-| `echo-plugin-host` | 运输层（inproc / stdio）+ supervisor + conformance 套件 | ⏳ M3 |
-| `echo-context` | 服务定位 `Ctx` + 类型化 `EventBus` + 可逆注册 | ⏳ M3 |
+```bash
+cargo test --workspace   # 165 项
+```
 
-> **M3 之前，宿主侧不在本仓。** 想跑一个完整例子，请看
-> [EchoAgentCore](https://github.com/EchoLab-Auto/EchoAgentCore) 的
-> `source/plugin/echo-plugin-host/`（它已按同一协议实现）。少量文档注释里引用的
-> `document/design/*.md` 路径也指向那个仓库，随 M4 的第三方文档一并迁来。
+**尚未达标的两点**（不掩饰）：
+- 协议表面仍带领域分类贡献（`Contribution::Tool` / `Skill` / `PluginInstance`），
+  去业务化排在 M5 且有兼容门槛；
+- `echo-context::kernel` 是一个进程级单例表（宿主侧应用单例的收敛点）。它属于
+  宿主机制而非框架职责，终态应搬出去；门禁里精确豁免了这一个文件。
+
+> 文档注释里少量 `document/design/*.md` 路径指向 EchoAgentCore 仓库——那是本仓
+> 前身所在地，第三方文档随 M4 迁来。
 
 ## 写一个插件
 

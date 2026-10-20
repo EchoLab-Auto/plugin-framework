@@ -1,7 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
+    # ── 装配层（宿主 + 插件两侧）─────────────────────────────────────────
+    "crates/echo-context",
     "crates/echo-plugin-api",
+    "crates/echo-plugin-loader",
+    "crates/echo-plugin",
+    "crates/echo-plugin-host",
     "crates/echo-plugin-sdk",
     # 仓库自守门禁（只含 tests/，审计跨 crate 的仓库属性）
     "crates/framework-gates",
@@ -14,8 +19,8 @@ rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/EchoLab-Auto/plugin-framework"
 
-# 与 EchoAgentCore 根 Cargo.toml 保持同版本口径（迁出期同步，避免行为漂移）。
-# 六件套齐备（M3）后本仓独立演进，届时此处不再需要与 Core 对齐。
+# 只列**通用第三方库**。本仓不允许出现面向具体应用的依赖
+# （由 `crates/framework-gates` 的门禁守着）。
 [workspace.dependencies]
 # async runtime
 tokio = { version = "1", features = ["full"] }
@@ -23,6 +28,7 @@ tokio = { version = "1", features = ["full"] }
 # serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
 # error handling
 thiserror = "2"
@@ -32,6 +38,19 @@ tracing = "0.1"
 
 # misc
 async-trait = "0.1"
+base64 = "0.22"
+dashmap = "6"
+
+# 子进程资源限额（setrlimit）：仅 Unix 生效，见 `echo-plugin-host::stdio`。
+libc = "0.2"
 
 # 本仓内部 crate
+echo-context = { path = "crates/echo-context" }
 echo-plugin-api = { path = "crates/echo-plugin-api" }
+echo-plugin-loader = { path = "crates/echo-plugin-loader" }
+echo-plugin = { path = "crates/echo-plugin" }
+echo-plugin-host = { path = "crates/echo-plugin-host" }
+echo-plugin-sdk = { path = "crates/echo-plugin-sdk" }
+
+# dev
+proptest = "1"
