@@ -23,7 +23,7 @@ pub use event::{EventSink, PluginEvent, ALL_EVENTS};
 pub use manifest::{PluginError, PluginManifest, PluginRuntime};
 pub use plugin::{
     BuiltinPlugin, CommandFuture, Inject, MountContext, Plugin, PluginMountError,
-    PluginMountResult, PluginTextBlock,
+    PluginMountResult, PluginTextBlock, ServiceSlot,
 };
 pub use registry::{PluginDefinition, PluginDescriptor, PluginRegistry, ReconcileReport};
 pub use scope::PluginScope;

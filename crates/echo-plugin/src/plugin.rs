@@ -167,6 +167,111 @@ impl MountContext {
     }
 }
 
+/// 一个**在 `mount` 时解析、在处理时取用**的服务槽。
+///
+/// 插件的能力依赖常常是这样的：`mount` 期间才有 `MountContext`（因此才能查
+/// 服务表），而真正用到宿主能力的地方是命令处理器 / 事件回调——那些闭包在
+/// 构造插件时就得交出去，拿不到 `MountContext`。
+///
+/// 手写这段（`Arc<RwLock<Option<T>>>` + 卸载时清空）在每个插件里都长得一样，
+/// 且极易漏掉"卸载要清空"（清不掉就会拿着旧宿主的句柄继续跑）。这里收成
+/// 一个类型：
+///
+/// ```ignore
+/// let host = ServiceSlot::new();
+/// let bind = host.clone();
+/// BuiltinPlugin::new(manifest, move |mctx| {
+///     let keep = bind.bind(mctx, &HOST_KEY)?;   // 解析 + 记录 + 卸载清理
+///     Ok(vec![keep])
+/// })
+/// .with_command_handler_async({
+///     let host = host.clone();
+///     move |name, payload| {
+///         let host = host.clone();
+///         Box::pin(async move {
+///             let Some(host) = host.get() else { return None };
+///             host.handle(name, payload).await
+///         })
+///     }
+/// })
+/// ```
+///
+/// **不缓存 `MountContext` 本身**：那会把整张服务表钉在插件里；这里只留插件
+/// 声明过的那一个键。
+pub struct ServiceSlot<T: Clone> {
+    inner: Arc<std::sync::RwLock<Option<T>>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> Default for ServiceSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Clone> Clone for ServiceSlot<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> ServiceSlot<T> {
+    /// 空槽。
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// 当前绑定的值（未挂载 / 已卸载时为 `None`）。
+    pub fn get(&self) -> Option<T> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 是否已绑定。
+    pub fn is_bound(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// 手工绑定（不经服务表；单测与"宿主直接塞"的场景）。
+    pub fn set(&self, value: T) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value);
+    }
+
+    /// 手工清空。
+    pub fn clear(&self) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// 从挂载上下文解析并绑定；返回的 [`Disposer`] 在卸载时清空槽位。
+    ///
+    /// 缺失即 `MissingService`——**挂载失败比"挂着但什么都做不了"好**：
+    /// 后者在运行期表现为"点了没反应"。
+    pub fn bind(
+        &self,
+        mctx: &MountContext,
+        key: &echo_context::ServiceKey<T>,
+    ) -> Result<Disposer, PluginMountError> {
+        let value = mctx.require(key)?;
+        self.set(value);
+        let slot = self.clone();
+        Ok(Disposer::from_fn(move || slot.clear()))
+    }
+}
+
 /// Mount error kinds.
 #[derive(Debug, thiserror::Error)]
 pub enum PluginMountError {
@@ -698,5 +803,56 @@ mod mount_context_service_tests {
             Err(PluginMountError::MissingService { .. })
         ));
         assert!(mctx.context().is_none());
+    }
+}
+
+#[cfg(test)]
+mod service_slot_tests {
+    use super::*;
+    use echo_context::{Ctx, ServiceKey};
+
+    static HOST: ServiceKey<Arc<dyn Fn() -> u32 + Send + Sync>> =
+        ServiceKey::new("slot.test.host");
+
+    /// 绑定后可取用；`Disposer` 落下即清空（卸载不留旧句柄）。
+    #[test]
+    fn bind_then_dispose_clears_the_slot() {
+        let ctx = Arc::new(Ctx::default());
+        let _keep = ctx.provide(&HOST, Arc::new(|| 9u32) as Arc<dyn Fn() -> u32 + Send + Sync>);
+        let mctx = MountContext::new().with_ctx(ctx);
+
+        let slot: ServiceSlot<Arc<dyn Fn() -> u32 + Send + Sync>> = ServiceSlot::new();
+        assert!(!slot.is_bound());
+
+        let disposer = slot.bind(&mctx, &HOST).expect("宿主已注册");
+        assert!(slot.is_bound());
+        assert_eq!(slot.get().unwrap()(), 9);
+
+        disposer.dispose();
+        assert!(!slot.is_bound(), "卸载必须清空——否则会拿着旧宿主的句柄继续跑");
+    }
+
+    /// 缺失即挂载失败（不留"挂着但什么都做不了"的半状态）。
+    #[test]
+    fn bind_fails_when_the_host_is_missing() {
+        let ctx = Arc::new(Ctx::default());
+        let mctx = MountContext::new().with_ctx(ctx);
+        let slot: ServiceSlot<Arc<dyn Fn() -> u32 + Send + Sync>> = ServiceSlot::new();
+        assert!(matches!(
+            slot.bind(&mctx, &HOST),
+            Err(PluginMountError::MissingService { .. })
+        ));
+        assert!(!slot.is_bound());
+    }
+
+    /// 克隆共享同一个槽（mount 闭包与命令处理器各持一份）。
+    #[test]
+    fn clones_share_one_slot() {
+        let a: ServiceSlot<u8> = ServiceSlot::new();
+        let b = a.clone();
+        a.set(3);
+        assert_eq!(b.get(), Some(3));
+        b.clear();
+        assert_eq!(a.get(), None);
     }
 }
