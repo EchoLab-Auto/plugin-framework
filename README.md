@@ -43,6 +43,11 @@ cargo build -p minimal-plugin && cargo run -p minimal-host
 依赖，由 `cargo test -p echo-plugin-host --test cross_language` 真跑。详见
 [examples/README.md](./examples/README.md) 与 [快速上手](./docs/getting-started.md)。
 
+**文档**：[`document/`](./document/index.md) 是 ProDoc 文档图（10 篇，`echo-prodoc
+check` 通过）——按「为什么 → 核心模型 → 六件套 → 插件语义 → 生命周期 / 运输层 /
+配置 → 上手 → 边界」组织，适合先读一遍再动手；`docs/getting-started.md` 是单篇
+速查版。
+
 **零全局态现在是无条件成立的**（v0.3.0）：原 `echo-context::kernel`（进程级
 单例表）已搬到宿主侧。理由：使用者全在应用层（8 处），框架一处不用；框架导出
 进程级单例表会直接破坏「同一进程能起两套宿主」这个复用前提。
