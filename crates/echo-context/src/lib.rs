@@ -18,10 +18,19 @@
 //!   declaration merging): any new event type is a new `Event` implementor.
 //! - [`ScopedRegistry`] — name-keyed registrations with per-scope shadowing:
 //!   a scoped entry replaces its same-named global twin for that scope alone.
+//!
+//! # 全局态不在此（v0.3.0）
+//!
+//! 曾有一个 `kernel` 模块——一张 `TypeId` 键控的进程级单例表。它是宿主应用的
+//! 机制（使用者全在应用层，本 crate 及其兄弟 crate 一处不用），留在框架里会
+//! 破坏"同一进程能起两套宿主"这个复用前提。现已搬到宿主侧（EchoAgentCore 的
+//! `echo-bootstrap`）。
+//!
+//! 要表达"这个宿主里只有一份服务"，请用 [`Ctx`]：它是显式注入的，可以有任意
+//! 多份，互不干扰。
 
 mod ctx;
 mod event;
-pub mod kernel;
 mod scope;
 mod service_key;
 

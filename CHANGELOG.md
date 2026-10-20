@@ -4,6 +4,33 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.3.0] — 2026-10-19
+
+**breaking**：移除 `echo_context::kernel`（进程级单例表，`pub mod kernel`）。
+框架仓的「零全局态」从此无条件成立。
+
+### 移除
+
+- `echo-context::kernel`（`set` / `get` / `get_or_init` 三个函数 + 那张
+  `TypeId` 键控表）。它已搬到宿主侧：EchoAgentCore 的 `echo-bootstrap` crate。
+
+### 为什么搬走
+
+1. **框架自己一处不用**——六个 crate 里零调用；8 处使用者全在应用层
+   （`agent_manager` / `plugin_host` / `global_policy` / `shell_manager` /
+   搜索客户端 / 联邦导入）。
+2. **它破坏复用前提**。「同一进程能起两套宿主」要求框架不在进程级藏状态；
+   有这张表的话，第二套宿主会读到第一套的句柄。
+
+终态应当是让宿主把句柄经 `echo_context::Ctx` 显式注入（`Ctx::provide` 已经
+具备能力，且天然支持多份）。`echo-bootstrap` 是到达终态之前的过渡形态，
+其 crate 文档写明了这一点。
+
+### 迁移方式
+
+宿主侧调用点把 `echo_context::kernel::set(…)` 改成 `echo_bootstrap::set(…)`
+（14 处，纯改名，行为不变）。
+
 ## [0.2.0] — 2026-10-19
 
 迁入宿主侧四件套，**六件套齐备**——本仓现在可以独立跑通端到端插件链路。

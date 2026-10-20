@@ -10,17 +10,16 @@
 
 use std::path::{Path, PathBuf};
 
-/// **唯一白名单**：进程级引导单元（详见该文件头部注释）。
+/// 白名单：**空**（v0.3.0 起）。
 ///
-/// 为什么不直接修掉：它是宿主侧应用单例的收敛点（`agent_manager` /
-/// `plugin_host` / `global_policy` / `shell_manager` / 搜索客户端 / 联邦导入
-/// 共 8 处调用），框架自己一处都不用。**正确的终态是把它搬到宿主侧**
-/// （本仓不该导出进程级单例表），但那要新建宿主 crate 并改 8 个调用点，
-/// 超出"原样搬迁"的范围，登记为后续任务。
+/// 曾经豁免 `crates/echo-context/src/kernel.rs`（进程级引导单元）。它已搬到
+/// 宿主侧（EchoAgentCore 的 `echo-bootstrap`）：那是宿主应用的机制——使用者
+/// 全在应用层，框架一处不用；而框架导出进程级单例表会直接破坏"同一进程能起
+/// 两套宿主"。
 ///
-/// 现在的处理：**精确到文件**地豁免一个文件，且数量恒为 1——新增任何其它
-/// 全局态仍然红。棘轮不会因此松开。
-const WHITELIST: &[&str] = &["crates/echo-context/src/kernel.rs"];
+/// 因此本仓的「零全局态」现在是**无条件**成立的。这个常量保留为空是为了让
+/// 将来若真有豁免有显式位置——空着比删掉更难被误用。
+const WHITELIST: &[&str] = &[];
 
 /// 会被判为全局态的模式。
 const GLOBAL_STATE_PATTERNS: &[&str] = &[
@@ -120,19 +119,18 @@ fn framework_libraries_have_no_global_state() {
 
     assert!(
         violations.is_empty(),
-        "框架层出现了全局态（可复用性要求：同一进程能起多套宿主）。\n唯一豁免是 {}：\n{}",
-        WHITELIST.join(", "),
+        "框架层出现了全局态（可复用性要求：同一进程能起多套宿主；白名单应为空）：\n{}",
         violations.join("\n")
     );
 }
 
-/// 自检：白名单不能扩大。
+/// 自检：白名单必须是空的（v0.3.0 起无条件零全局态）。
 #[test]
-fn whitelist_stays_minimal() {
-    assert_eq!(
-        WHITELIST,
-        &["crates/echo-context/src/kernel.rs"],
-        "白名单是棘轮：只允许减，不允许加。要加新条目请先在评审里论证必要性"
+fn whitelist_stays_empty() {
+    assert!(
+        WHITELIST.is_empty(),
+        "框架仓不允许任何全局态豁免。若确有例外，请先论证它与\
+         「同一进程能起两套宿主」不冲突；当前多余条目：{WHITELIST:?}"
     );
 }
 
