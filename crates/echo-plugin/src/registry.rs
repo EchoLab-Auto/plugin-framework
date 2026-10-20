@@ -7,6 +7,7 @@ use echo_context::Disposer;
 
 use crate::manifest::PluginManifest;
 use crate::plugin::{MountContext, Plugin, PluginMountError, PluginMountResult};
+use crate::runtime_state::RuntimeState;
 
 /// Frontend-facing snapshot of a plugin's state.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -228,6 +229,12 @@ pub struct PluginRegistry {
     /// 插件的 `emit` 因此不必知道自己的 id；② 挂/卸时由注册表自己发
     /// `plugin.mounted` / `plugin.unmounted`（插件树的观测面）。
     event_sink: std::sync::Mutex<Option<crate::EventSink>>,
+    /// 运行态：缓存的挂载上下文 / 事件订阅兴趣集 / 投递重入与计数。
+    ///
+    /// 这四样都与领域无关（任何宿主都要），此前由宿主包一层自己维护
+    /// （`echo-agent` 的 `PluginHost` 曾为此多出 ~150 行状态管理）。上收到
+    /// 注册表之后，宿主只剩领域翻译与配置格式。
+    runtime: std::sync::Mutex<crate::runtime_state::RuntimeState>,
     /// 因**依赖未就绪**而没挂上的插件 → 当时缺的键。
     ///
     /// 与 `enabled_state = false`（人主动禁用）区分开：这些是"该挂、还没
@@ -252,6 +259,168 @@ impl std::fmt::Debug for PluginRegistry {
 impl PluginRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // ── 运行态（2026-11：从宿主上收）────────────────────────────────────
+    //
+    // 缓存的挂载上下文 / 事件兴趣集 / 投递重入与计数。四者都与领域无关，
+    // 此前每个宿主都得自己包一层维护；现在注册表是唯一持有者。
+
+    /// 记住挂载上下文。之后 [`Self::enable`] / [`Self::restart_cached`] /
+    /// [`Self::reconcile_cached`] 不必再让调用方传它。
+    ///
+    /// 为什么需要缓存：`MountContext` 里带服务表（`Ctx`）与事件出口，它们在
+    /// 进程寿命内是同一份；每次生命周期动作让调用方重复传，只会让宿主被迫
+    /// 自己存一份（`echo-agent` 的 `PluginHost` 曾经就是这么来的）。
+    pub fn set_mount_ctx(&self, ctx: crate::MountContext) {
+        self.runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_mount_ctx(ctx);
+    }
+
+    /// 取回缓存的挂载上下文（未设置时 `None`）。
+    pub fn mount_ctx(&self) -> Option<crate::MountContext> {
+        self.runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mount_ctx()
+    }
+
+    /// 取缓存上下文或默认值（生命周期方法用；未设置 = 裸注册表语义）。
+    fn cached_ctx(&self) -> crate::MountContext {
+        self.mount_ctx().unwrap_or_default()
+    }
+
+    /// 启用 / 停用一个插件（用**缓存的**上下文，见 [`Self::set_mount_ctx`]）。
+    ///
+    /// **语义 = 状态切换**，不是"确保挂载"：插件的默认状态是启用，所以对
+    /// 一个从未挂载过的插件调 `enable(id, true)` 是 no-op（它已是"启用"
+    /// 状态）。初始挂载走 [`Self::mount`] / [`Self::mount_all`] /
+    /// [`Self::mount_plan`](crate::PluginRegistry::mount_all)，停用后再启用
+    /// 才由本方法真正重挂。
+    pub fn enable(&self, id: &str, enabled: bool) -> Result<(), String> {
+        let ctx = self.cached_ctx();
+        self.set_enabled(id, enabled, &ctx)
+    }
+
+    /// 重启一个插件（卸载 + 重挂载，用缓存的上下文）。
+    pub fn restart_cached(&self, id: &str) -> Result<(), String> {
+        let ctx = self.cached_ctx();
+        self.restart(id, &ctx)
+    }
+
+    /// 依赖变动后重挂 / 卸下 pending 插件（用缓存的上下文）。
+    pub fn reconcile_cached(&self) -> ReconcileReport {
+        let ctx = self.cached_ctx();
+        self.reconcile(&ctx)
+    }
+
+    /// 是否有任何已挂载插件订阅了事件（**一次原子读**）。
+    ///
+    /// 热路径第一道闸门：`emit` 在流式正文里每 token 一条，无人订阅时必须
+    /// 立刻返回、不序列化。
+    pub fn has_event_subscribers(&self) -> bool {
+        self.runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_subscribers()
+    }
+
+    /// 该事件名当前是否有人订阅（不序列化；热路径第二道闸门）。
+    pub fn wants_event(&self, name: &str) -> bool {
+        self.runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wants(name)
+    }
+
+    /// 重算事件订阅兴趣集。
+    ///
+    /// 由注册表在**挂载 / 卸载 / 启停 / 重启 / reconcile 之后自己调**
+    /// （见各方法末尾），宿主不必记得——忘了只会让热路径多付序列化代价，
+    /// 不会丢事件。
+    ///
+    /// 只统计**已挂载**且**已启用**的插件：没挂载的插件不该收到事件，替它
+    /// 占位订阅会让热路径付无意义的代价。
+    pub fn refresh_event_interest(&self) {
+        let subscriptions: Vec<Vec<String>> = {
+            let plugins = self
+                .plugins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let states = self
+                .enabled_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let active = self
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            plugins
+                .iter()
+                .filter(|(id, _)| {
+                    active.contains_key(*id) && states.get(*id).copied().unwrap_or(true)
+                })
+                .map(|(_, plugin)| plugin.subscribed_events())
+                .collect()
+        };
+        self.runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .refresh_interest(subscriptions.into_iter());
+    }
+
+    /// 投递一条插件事件，带**重入保护**与计数。
+    ///
+    /// 插件的 `on_event` 里若再触发一次 `emit`（比如它调了个会发事件的宿主
+    /// API），内层直接丢并记一次失败——没有这道闸就是自递归。
+    pub fn deliver_event_guarded(&self, event: &crate::PluginEvent) -> usize {
+        // 先判重入，再进投递段（`enter_delivery` 是原子的比较并交换）。
+        let entered = {
+            let runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !runtime.enter_delivery() {
+                runtime.record_failed();
+                false
+            } else {
+                true
+            }
+        };
+        if !entered {
+            tracing::debug!(
+                name = %event.name,
+                "plugin event dropped: delivery is already in progress (re-entrant emit)"
+            );
+            return 0;
+        }
+        /// 保证离开投递段（即使投递过程中 panic）。
+        struct Leave<'a>(&'a RuntimeState);
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                self.0.leave_delivery();
+            }
+        }
+        let delivered = self.deliver_event(event);
+        {
+            let runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _leave = Leave(&runtime);
+            runtime.record_delivered(delivered);
+        }
+        delivered
+    }
+
+    /// `(投递成功条数, 丢弃/失败条数)`——排查「事件为什么没到」的第一手证据。
+    pub fn event_counters(&self) -> (u64, u64) {
+        self.runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counters()
     }
 
     /// Register a plugin definition (composition root / discovery). Does not
@@ -356,6 +525,9 @@ impl PluginRegistry {
         );
         self.clear_pending(id);
         self.set_plugin_error_cleared(id);
+        // 订阅兴趣集随之变化——热路径闸门由注册表自己维护，宿主不必记得
+        // （忘了只会让热路径多付序列化代价，不会丢事件）。
+        self.refresh_event_interest();
         Ok(Vec::new())
     }
 
@@ -392,6 +564,8 @@ impl PluginRegistry {
                 serde_json::json!({ "id": id, "depth": self.depth() }),
             );
         }
+        // 订阅兴趣集随之收缩（同 `mount` 末尾的理由）。
+        self.refresh_event_interest();
         Ok(())
     }
 
@@ -848,23 +1022,29 @@ impl PluginRegistry {
         if !exists {
             return Err(format!("plugin not found: {id}"));
         }
-        let mut states = self
-            .enabled_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if enabled {
-            if states.get(id).copied().unwrap_or(true) {
-                return Ok(()); // already enabled
+        // **锁范围刻意缩小**（2026-11）：`mount` / `unmount` 内部会刷新订阅
+        // 兴趣集，而刷新要读 `enabled_state`——持着它调用就是自锁。所以这里
+        // 只做「读判断 → 释放 → 动作 → 写状态 → 刷新」。
+        {
+            let states = self
+                .enabled_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if states.get(id).copied().unwrap_or(true) == enabled {
+                return Ok(()); // 已经是目标状态
             }
-            self.mount(id, ctx).map_err(|e| e.to_string())?;
-            states.insert(id.to_string(), true);
-        } else {
-            if !states.get(id).copied().unwrap_or(true) {
-                return Ok(()); // already disabled
-            }
-            self.unmount(id).map_err(|e| e.to_string())?;
-            states.insert(id.to_string(), false);
         }
+        if enabled {
+            self.mount(id, ctx).map_err(|e| e.to_string())?;
+        } else {
+            self.unmount(id).map_err(|e| e.to_string())?;
+        }
+        self.enabled_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_string(), enabled);
+        // 状态变了 → 兴趣集重算（`mount` 里那次算的是旧 enabled 值）。
+        self.refresh_event_interest();
         Ok(())
     }
 
@@ -1977,5 +2157,139 @@ mod async_command_tests {
             .dispatch_command_async("Nope", serde_json::Value::Null)
             .await
             .is_none());
+    }
+
+    // ── 运行态（2026-11 从宿主上收）────────────────────────────────────
+
+    use crate::plugin::BuiltinPlugin;
+
+    /// 缓存上下文后，`enable` / `restart_cached` / `reconcile_cached` 不必
+    /// 再让调用方传 `MountContext`——宿主因此不需要自己存一份。
+    #[test]
+    fn cached_mount_ctx_lets_lifecycle_calls_skip_the_argument() {
+        let reg = PluginRegistry::new();
+        let mounted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = mounted.clone();
+        reg.register(Arc::new(BuiltinPlugin::new(
+            PluginManifest::builtin("rt.cached", "cached", "1.0", "tool", "e", "d"),
+            move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![])
+            },
+        )))
+        .unwrap();
+        reg.set_mount_ctx(MountContext::new());
+        assert!(reg.mount_ctx().is_some(), "上下文必须被缓存");
+
+        // 初始挂载走 mount_all（`enable(true)` 对"已启用"是 no-op，见其文档）。
+        reg.mount_all(&MountContext::new());
+        assert!(reg.is_mounted("rt.cached"));
+        reg.enable("rt.cached", false).expect("停用（用缓存上下文）");
+        assert!(!reg.is_mounted("rt.cached"));
+        reg.enable("rt.cached", true).expect("重新启用（用缓存上下文）");
+        assert!(reg.is_mounted("rt.cached"));
+        reg.restart_cached("rt.cached").expect("重启（用缓存上下文）");
+        assert!(reg.is_mounted("rt.cached"));
+    }
+
+    /// 未设置缓存上下文也能用（裸注册表语义：默认 `MountContext`）。
+    #[test]
+    fn lifecycle_calls_work_without_a_cached_ctx() {
+        let reg = PluginRegistry::new();
+        reg.register(Arc::new(BuiltinPlugin::new(
+            PluginManifest::builtin("rt.naked", "naked", "1.0", "tool", "e", "d"),
+            |_| Ok(vec![]),
+        )))
+        .unwrap();
+        // 无缓存上下文 = 默认 `MountContext`（裸注册表语义）。
+        reg.mount_all(&MountContext::new());
+        assert!(reg.is_mounted("rt.naked"));
+        reg.enable("rt.naked", false).expect("停用不需要上下文");
+        reg.enable("rt.naked", true).expect("重新启用不需要上下文");
+        assert!(reg.is_mounted("rt.naked"));
+    }
+
+    /// 兴趣集由**注册表自己**在挂/卸后刷新：宿主不必记得调。
+    ///
+    /// 忘了刷新的后果只是热路径多付序列化代价，不会丢事件——但"必须记得"
+    /// 本身就是一层不该存在的负担。
+    #[test]
+    fn event_interest_refreshes_itself_on_mount_and_unmount() {
+        let reg = PluginRegistry::new();
+        reg.register(Arc::new(
+            BuiltinPlugin::new(
+                PluginManifest::builtin("rt.sub", "sub", "1.0", "tool", "e", "d"),
+                |_| Ok(vec![]),
+            )
+            .with_subscriptions(["tool.done"]),
+        ))
+        .unwrap();
+        assert!(!reg.has_event_subscribers(), "未挂载时不该有人订阅");
+        reg.mount_all(&MountContext::new());
+        assert!(reg.has_event_subscribers(), "挂载后兴趣集必须刷新");
+        assert!(reg.wants_event("tool.done"));
+        assert!(!reg.wants_event("other"));
+        reg.enable("rt.sub", false).expect("停用");
+        assert!(!reg.has_event_subscribers(), "停用后兴趣集必须收缩");
+    }
+
+    /// 通配订阅：`*` 让所有名字都命中。
+    #[test]
+    fn wildcard_subscription_wants_everything() {
+        let reg = PluginRegistry::new();
+        reg.register(Arc::new(
+            BuiltinPlugin::new(
+                PluginManifest::builtin("rt.all", "all", "1.0", "tool", "e", "d"),
+                |_| Ok(vec![]),
+            )
+            .with_subscriptions([crate::ALL_EVENTS]),
+        ))
+        .unwrap();
+        reg.mount_all(&MountContext::new());
+        assert!(reg.wants_event("anything.at.all"));
+    }
+
+    /// 投递带重入保护：插件的 `on_event` 里再 emit，内层被丢并计数。
+    #[test]
+    fn guarded_delivery_drops_reentrant_emits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Reentrant {
+            manifest: PluginManifest,
+            registry: std::sync::Mutex<Option<Arc<PluginRegistry>>>,
+            attempts: Arc<AtomicUsize>,
+        }
+        impl Plugin for Reentrant {
+            fn manifest(&self) -> &PluginManifest {
+                &self.manifest
+            }
+            fn mount(&self, _ctx: &MountContext) -> PluginMountResult {
+                Ok(vec![])
+            }
+            fn subscribed_events(&self) -> Vec<String> {
+                vec!["ping".to_string()]
+            }
+            fn on_event(&self, event: &crate::PluginEvent) -> Result<(), String> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                // 在事件处理里再投递一次——内层应当被重入保护丢弃。
+                if let Some(reg) = self.registry.lock().unwrap().as_ref() {
+                    reg.deliver_event_guarded(event);
+                }
+                Ok(())
+            }
+        }
+        let reg = Arc::new(PluginRegistry::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        reg.register(Arc::new(Reentrant {
+            manifest: PluginManifest::builtin("rt.re", "re", "1.0", "tool", "e", "d"),
+            registry: std::sync::Mutex::new(Some(Arc::clone(&reg))),
+            attempts: attempts.clone(),
+        }))
+        .unwrap();
+        reg.mount_all(&MountContext::new());
+        reg.deliver_event_guarded(&crate::PluginEvent::host("ping", serde_json::json!({})));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "内层必须被丢弃");
+        let (delivered, failed) = reg.event_counters();
+        assert_eq!(delivered, 1, "外层那次投递成功");
+        assert_eq!(failed, 1, "内层那次记一次失败");
     }
 }

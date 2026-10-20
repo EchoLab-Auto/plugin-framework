@@ -4,6 +4,49 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.10.0] — 2026-11-20
+
+**运行态上收**：把「宿主为了用这套框架而必须自己维护的状态」收进注册表。
+动机很具体——把内置能力逐一搬成插件之后，下游宿主（`echo-agent`）里那个
+`PluginHost` 还剩 1,559 行，其中一大半是在**重新实现框架本该有的运行态**：
+
+| 宿主自己维护的 | 为什么本来是框架的 |
+|---|---|
+| 缓存的 `MountContext` | `set_enabled` / `restart` / `reconcile` 每次都要它，宿主只能自己存一份 |
+| 事件订阅**兴趣集** | `emit` 是热路径（流式正文每 token 一条），没人订阅时要能一次原子读就返回 |
+| 投递**重入保护** | 插件的 `on_event` 里再 `emit` 会自递归 |
+| 投递**计数** | 排查「事件为什么没到」的第一手证据 |
+
+四者都与领域无关，任何宿主都会需要。
+
+### 新增
+
+- `PluginRegistry::set_mount_ctx(ctx)` / `mount_ctx()`：缓存挂载上下文；
+- `PluginRegistry::enable(id, enabled)` / `restart_cached(id)` /
+  `reconcile_cached()`：**不需要再传 `MountContext`**（用缓存的那份；
+  未设置 = 默认上下文，裸注册表语义不变）；
+- `PluginRegistry::has_event_subscribers()` / `wants_event(name)`：热路径
+  两道闸门（一次原子读 / 一次查表，都不序列化）；
+- `PluginRegistry::refresh_event_interest()`：重算兴趣集。**注册表自己在
+  挂载 / 卸载 / 启停 / 重启 / reconcile 之后调用**——宿主不必记得；
+- `PluginRegistry::deliver_event_guarded(event)`：投递 + 重入保护 + 计数；
+- `PluginRegistry::event_counters()`：`(投递成功, 丢弃/失败)`；
+- 新增私有模块 `runtime_state`（`RuntimeState` + `EventInterest`），带四项
+  单元测试。
+
+### 变更（语义澄清，非破坏）
+
+- `set_enabled` 的**锁范围缩小**：原来持着 `enabled_state` 调 `mount`，而
+  `mount` 现在会刷新兴趣集（也要读 `enabled_state`）——那是自锁。改为
+  「读判断 → 释放 → 动作 → 写状态 → 刷新」。
+- `enable(id, true)` 的语义明确写成**状态切换**（默认状态即"启用"，所以对
+  从未挂载过的插件是 no-op）。初始挂载仍走 `mount` / `mount_all`。
+
+### 影响
+
+下游只需要删代码：宿主里那份缓存与兴趣集实现可以直接删掉，改为委托。
+既有调用点（带 `&MountContext` 参数的版本）**全部保留**，不做破坏性改动。
+
 ## [0.9.0] — 2026-11-01
 
 命令处理补上**异步入口**——v0.8 的 `handle_command` 是同步的，只能做"不等"的

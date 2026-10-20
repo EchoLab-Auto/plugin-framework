@@ -16,6 +16,7 @@ pub mod event;
 pub mod manifest;
 pub mod plugin;
 pub mod registry;
+mod runtime_state;
 pub mod scope;
 
 pub use event::{EventSink, PluginEvent, ALL_EVENTS};

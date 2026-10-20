@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Plugin seam for EchoAgentCore: manifest + lifecycle + registry"
 
 [dependencies]
+tracing = { workspace = true }
 serde = { workspace = true }
 # `MountContext.config` 是宿主 → 插件的自由载荷（`plugins.toml` 的
 # `[plugin.config]` 原样透传）：框架不解释内容，只负责按 id 送到插件手里。
