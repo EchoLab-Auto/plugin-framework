@@ -4,6 +4,17 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.6.1] — 2026-11-01
+
+修 v0.6.0 的一个漏洞：**类型化 `provide` 不广播变更通知**。
+
+`register` 的注册/注销都会 `publish(Change)`（父链向上传播 + 唤醒等待者），
+但 `provide` 只 `notify_waiters()`——于是 `Ctx::on_change` 的订阅者（宿主的
+`reconcile`）看不到通过 `provide` 注册的服务。现在两条路径都走 `publish`。
++1 测试（`typed_provide_broadcasts_like_register`）。
+
+[0.6.1]: #061--2026-11-01
+
 ## [0.6.0] — 2026-11-01
 
 两块缺失的 dsh 语义补齐：**声明式 `inject` + 就绪等待**，以及**插件树 / 父 ctx**
