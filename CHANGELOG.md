@@ -4,6 +4,41 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.5.0] — 2026-11-01
+
+补上 in-process 插件缺失的两块机制：**配置下发**与**服务键依赖校验**。
+此前 `plugins.toml` 的 `[plugin.config]` 只能到子进程插件的 `Hello.config`，
+内置插件的 `mount` 拿不到自己的配置；`Contribution::Service` 也只是一个
+"声明了没人读"的字段。
+
+### 新增
+
+- `MountContext.config: serde_json::Value`（+ `with_config` / `config()` /
+  `config_str(key)`）：宿主按插件 id 注入该插件的配置，**缺省 `Null` 而非
+  `{}`**——插件要能区分「没配」与「配了空表」。框架不解析内容、不做 schema
+  校验，那是宿主与插件之间的契约。
+- `PluginRegistry::set_config` / `set_configs` / `config_for`：组合根在挂载前
+  登记配置；`mount()` 按 id 合并进传给该插件的 `MountContext`。运行期重新
+  挂载（`set_enabled(true)` / `restart`）取**当时**登记的值。
+- `Plugin::required_services() -> Vec<String>`（默认空）+ `BuiltinPlugin::
+  with_required_services`：插件声明「挂我之前这些服务键必须在 `Ctx` 里」。
+  `PluginRegistry::mount` 在跑 mount 闭包**之前**逐个 `Ctx::contains` 校验，
+  缺失即 `PluginMountError::MissingService { key, available }`——
+  **mount 闭包根本不会执行**（依赖没就绪就不该产生副作用）。
+  这与 dsh 的 `inject` 同义，只是以存在性校验的形式落地（框架不认识具体类型）。
+- `PluginDescriptor.required_services`（`#[serde(default)]`）：面板据此回答
+  「这个插件为什么不挂载」。
+
+### 为什么 `required_services` 用 `Vec<String>` 而不是类型化
+
+服务键的**存在性**是 `echo-context` 的概念（字符串 + 是否有），而"这个键背后
+是什么类型"是宿主与插件之间的私事。框架若要求类型化，就得认识宿主的 trait
+（`echo-plugin` 零领域依赖的边界就破了）。存在性校验已经能挡住真实故障：
+组合根把服务注册挪到挂载之后、或忘了注册——启动期立刻失败并列出可用服务，
+而不是"插件挂载成功、运行期才发现依赖不存在"。
+
+[0.5.0]: #050--2026-11-01
+
 ## [0.4.1] — 2026-10-19
 
 新增**跨语言插件示例与测试**——把「协议即 ABI」从说法变成可运行的事实。

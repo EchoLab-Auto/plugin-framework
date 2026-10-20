@@ -78,6 +78,14 @@ pub struct PluginDescriptor {
     /// 密钥，上协议即等于把它们送到前端内存与日志里。
     #[serde(default)]
     pub env_keys: Vec<String>,
+    /// 本插件**要求的服务键**（`Ctx` 命名空间；空 = 无要求）。
+    ///
+    /// 面板据此回答「这个插件为什么不挂载」：注册表在 mount 前逐个
+    /// `Ctx::contains` 校验，缺失即 [`PluginMountError::MissingService`]，
+    /// 于是 `enabled` 仍为 true 而 `error` 有值。与 `args`/`env_keys`
+    /// 同层——都是"排查挂载失败需要的信息"。
+    #[serde(default)]
+    pub required_services: Vec<String>,
 }
 
 /// 插件的**定义来源**（面板技术信息展示用）。
@@ -116,6 +124,7 @@ impl From<&PluginManifest> for PluginDescriptor {
             command: String::new(),
             args: Vec::new(),
             env_keys: Vec::new(),
+            required_services: Vec::new(),
         }
     }
 }
@@ -132,6 +141,12 @@ pub struct PluginRegistry {
     enabled_state: std::sync::Mutex<BTreeMap<String, bool>>,
     /// 插件 id → 声明它的配置层（展示用；见 [`PluginRegistry::set_config_origin`]）。
     config_origins: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// 插件 id → 该插件的配置（`plugins.toml` 的 `[plugin.config]` 投影）。
+    ///
+    /// mount 时按 id 注入 [`MountContext::config`]（见 [`Self::mount`]）：
+    /// 这是"配置下发"的唯一通路——插件不必自己找到并解析 `plugins.toml`，
+    /// 也就不会读到别的插件那一份。未登记的 id 得到 `Value::Null`。
+    configs: std::sync::Mutex<BTreeMap<String, serde_json::Value>>,
     /// 插件 id → 装配/启动失败原因（展示用；`None` 值表示"曾失败后已恢复"）。
     errors: std::sync::Mutex<BTreeMap<String, String>>,
     /// 插件 id → 「定义从哪来 / 怎么启动」（展示用；见
@@ -200,6 +215,16 @@ impl PluginRegistry {
     }
 
     /// Activate a plugin: run its mount hooks and retain disposers.
+    ///
+    /// 1. **服务键就绪校验**：插件通过 [`Plugin::required_services`] 声明的
+    ///    每个键都必须在 [`MountContext::ctx`] 里存在，否则
+    ///    [`PluginMountError::MissingService`]，**mount 闭包根本不会被调用**
+    ///    （依赖没就绪就不该产生任何副作用）。
+    /// 2. **配置注入**：把组合根通过 [`Self::set_config`] 登记的该插件配置
+    ///    合并进传给 mount 的上下文；插件拿到的 `MountContext.config` 就是
+    ///    它自己的那一份，不用自己去读 `plugins.toml`（也就不会读到别人的）。
+    ///
+    /// [`Plugin::required_services`]: crate::Plugin::required_services
     pub fn mount(&self, id: &str, ctx: &MountContext) -> PluginMountResult {
         let plugin = {
             let plugins = self
@@ -215,7 +240,25 @@ impl PluginRegistry {
                 }
             }
         };
-        let disposers = plugin.mount(ctx)?;
+        // 1) 依赖就绪（服务键）：缺失即拒绝挂载，且错误里带"有哪些可用"。
+        let required = plugin.required_services();
+        if !required.is_empty() {
+            let missing = match ctx.ctx.as_ref() {
+                Some(c) => required.iter().find(|key| !c.contains(key)).cloned(),
+                // 插件声明了服务依赖，但宿主没注入 Ctx——等同全部缺失。
+                None => required.first().cloned(),
+            };
+            if let Some(key) = missing {
+                let available = ctx.ctx.as_ref().map(|c| c.keys()).unwrap_or_default();
+                return Err(PluginMountError::MissingService { key, available });
+            }
+        }
+        // 2) 本插件配置（未登记 = Null）。
+        let plugin_ctx = MountContext {
+            ctx: ctx.ctx.clone(),
+            config: self.config_for(id),
+        };
+        let disposers = plugin.mount(&plugin_ctx)?;
         let mut active = self
             .active
             .lock()
@@ -387,6 +430,7 @@ impl PluginRegistry {
             if let Some(p) = plugins.get(&id) {
                 let mut d = PluginDescriptor::from(p.manifest());
                 d.enabled = states.get(&id).copied().unwrap_or(true);
+                d.required_services = p.required_services();
                 if let Some(origin) = origins.get(&id) {
                     d.config_origin = origin.clone();
                 }
@@ -405,17 +449,6 @@ impl PluginRegistry {
         out
     }
 
-    /// 记录「该插件由配置的哪一层声明」（组合根装载 `plugins.toml` 后写入）。
-    ///
-    /// 只影响展示（`PluginDescriptor::config_origin`）——运行期语义仍由
-    /// 启停状态与 mount 计划决定。
-    pub fn set_config_origin(&self, id: impl Into<String>, origin: impl Into<String>) {
-        self.config_origins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.into(), origin.into());
-    }
-
     /// 批量写入来源层（组合根一次装载多处声明时用）。
     pub fn set_config_origins<I, K, V>(&self, origins: I)
     where
@@ -430,6 +463,44 @@ impl PluginRegistry {
         for (id, origin) in origins {
             map.insert(id.into(), origin.into());
         }
+    }
+
+    /// 登记**某个插件的配置**（组合根装载 `plugins.toml` 后写入）。
+    ///
+    /// 只影响 `mount` 时注入给该插件的 [`MountContext::config`]：框架不解析
+    /// 内容、不做 schema 校验（那是插件与宿主之间的契约），也不回写任何文件。
+    /// 运行期重新挂载（`set_enabled(true)` / `restart`）会取**当时**登记的值
+    /// ——先 `set_config` 再启用，插件看到的就是新配置。
+    pub fn set_config(&self, id: impl Into<String>, config: serde_json::Value) {
+        self.configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.into(), config);
+    }
+
+    /// 批量登记插件配置（组合根一次装载多处声明时用）。
+    pub fn set_configs<I, K>(&self, configs: I)
+    where
+        I: IntoIterator<Item = (K, serde_json::Value)>,
+        K: Into<String>,
+    {
+        let mut map = self
+            .configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (id, config) in configs {
+            map.insert(id.into(), config);
+        }
+    }
+
+    /// 某插件登记的配置（未登记 = `Null`）。
+    pub fn config_for(&self, id: &str) -> serde_json::Value {
+        self.configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
     }
 
     /// 记录「定义从哪来 / 怎么启动」（面板技术信息用）。
@@ -685,5 +756,162 @@ mod tests {
         let errors = reg.mount_all(&MountContext::new());
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].0, "f.f.f");
+    }
+
+    /// 配置下发：mount 时插件拿到**自己那一份** `MountContext.config`。
+    ///
+    /// 这是 `plugins.toml` 的 `[plugin.config]` 进入 in-process 插件的唯一
+    /// 通路：框架按 id 分发，插件不必（也不能）自己去读别人的配置。
+    #[test]
+    fn mount_injects_per_plugin_config() {
+        use std::sync::Mutex;
+
+        let reg = PluginRegistry::new();
+        // 两个插件各自记录 mount 时看到的 config。
+        let seen_a: Arc<Mutex<serde_json::Value>> = Arc::new(Mutex::new(serde_json::Value::Null));
+        let seen_b = Arc::new(Mutex::new(serde_json::Value::Null));
+        for (id, slot) in [("cfg.a", seen_a.clone()), ("cfg.b", seen_b.clone())] {
+            let slot = slot.clone();
+            reg.register(Arc::new(BuiltinPlugin::new(
+                PluginManifest::builtin(id, id, "1", "tool", "", ""),
+                move |mctx: &MountContext| {
+                    *slot.lock().unwrap() = mctx.config().clone();
+                    Ok(vec![])
+                },
+            )))
+            .unwrap();
+        }
+        reg.set_config("cfg.a", serde_json::json!({"port": 9001}));
+        reg.set_config("cfg.b", serde_json::json!({"mode": "fast"}));
+
+        reg.mount_all(&MountContext::new());
+
+        assert_eq!(seen_a.lock().unwrap()["port"], 9001);
+        assert_eq!(seen_b.lock().unwrap()["mode"], "fast");
+        // 各拿各的：B 看不到 A 的键。
+        assert!(seen_b.lock().unwrap().get("port").is_none());
+    }
+
+    /// 未登记配置 = `Null`（而不是 `{}`）：插件要能区分「没配」与「配了空表」。
+    #[test]
+    fn absent_config_is_null_not_empty_object() {
+        use std::sync::Mutex;
+        let reg = PluginRegistry::new();
+        let seen: Arc<Mutex<serde_json::Value>> = Arc::new(Mutex::new(serde_json::json!("unset")));
+        let slot = seen.clone();
+        reg.register(Arc::new(BuiltinPlugin::new(
+            PluginManifest::builtin("cfg.none", "n", "1", "tool", "", ""),
+            move |mctx: &MountContext| {
+                *slot.lock().unwrap() = mctx.config().clone();
+                Ok(vec![])
+            },
+        )))
+        .unwrap();
+        reg.mount_all(&MountContext::new());
+        assert!(seen.lock().unwrap().is_null());
+        assert_eq!(reg.descriptors()[0].required_services, Vec::<String>::new());
+    }
+
+    /// 运行时重新启用会取**当时**登记的配置（先 set_config 再启用即生效）。
+    #[test]
+    fn reenable_picks_up_new_config() {
+        use std::sync::Mutex;
+        let reg = PluginRegistry::new();
+        let ctx = MountContext::new();
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let slot = seen.clone();
+        reg.register(Arc::new(BuiltinPlugin::new(
+            PluginManifest::builtin("cfg.re", "r", "1", "tool", "", ""),
+            move |mctx: &MountContext| {
+                slot.lock().unwrap().push(mctx.config().clone());
+                Ok(vec![])
+            },
+        )))
+        .unwrap();
+        reg.set_config("cfg.re", serde_json::json!({"v": 1}));
+        reg.mount_all(&ctx);
+        assert_eq!(reg.set_enabled("cfg.re", false, &ctx), Ok(()));
+        reg.set_config("cfg.re", serde_json::json!({"v": 2}));
+        assert_eq!(reg.set_enabled("cfg.re", true, &ctx), Ok(()));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["v"], 1);
+        assert_eq!(seen[1]["v"], 2);
+    }
+
+    /// 服务键就绪校验：依赖缺失 → mount 失败，且 **mount 闭包不执行**
+    /// （依赖没就绪就不该产生任何副作用）。
+    #[test]
+    fn missing_required_service_blocks_mount() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let reg = PluginRegistry::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        reg.register(Arc::new(
+            BuiltinPlugin::new(
+                PluginManifest::builtin("svc.x", "x", "1", "loop", "", ""),
+                move |_| {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(vec![])
+                },
+            )
+            .with_required_services(["loop"]),
+        ))
+        .unwrap();
+
+        // 1) 没有任何 Ctx：缺失。
+        let err = match reg.mount("svc.x", &MountContext::new()) {
+            Ok(_) => panic!("expected MissingService, got Ok"),
+            Err(e) => e,
+        };
+        match err {
+            PluginMountError::MissingService { key, available } => {
+                assert_eq!(key, "loop");
+                assert!(available.is_empty());
+            }
+            other => panic!("expected MissingService, got {other:?}"),
+        }
+        assert!(!ran.load(Ordering::SeqCst), "mount 闭包不该执行");
+
+        // 2) 有 Ctx 但没这个键：仍然缺失，错误里列出可用键。
+        let ctx = echo_context::Ctx::default();
+        let ctx = Arc::new(ctx);
+        let _keep = ctx.register::<u8>("other", 1u8);
+        let err = match reg.mount("svc.x", &MountContext::new().with_ctx(ctx.clone())) {
+            Ok(_) => panic!("expected MissingService, got Ok"),
+            Err(e) => e,
+        };
+        match err {
+            PluginMountError::MissingService { key, available } => {
+                assert_eq!(key, "loop");
+                assert_eq!(available, vec!["other".to_string()]);
+            }
+            other => panic!("expected MissingService, got {other:?}"),
+        }
+        assert!(!ran.load(Ordering::SeqCst));
+
+        // 3) 服务就绪：挂载成功。
+        let _keep2 = ctx.register::<u8>("loop", 2u8);
+        reg.mount("svc.x", &MountContext::new().with_ctx(ctx))
+            .expect("service present -> mount succeeds");
+        assert!(ran.load(Ordering::SeqCst), "服务就绪后 mount 闭包应执行");
+    }
+
+    /// 声明的服务键出现在 descriptor 里（面板可见「它要什么」）。
+    #[test]
+    fn descriptors_expose_required_services() {
+        let reg = PluginRegistry::new();
+        reg.register(Arc::new(
+            BuiltinPlugin::new(
+                PluginManifest::builtin("svc.d", "d", "1", "loop", "", ""),
+                |_| Ok(vec![]),
+            )
+            .with_required_services(["loop", "sanitizer"]),
+        ))
+        .unwrap();
+        assert_eq!(
+            reg.descriptors()[0].required_services,
+            vec!["loop".to_string(), "sanitizer".to_string()]
+        );
     }
 }
