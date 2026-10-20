@@ -100,6 +100,17 @@ pub struct PluginDescriptor {
     /// 空 = 不订阅。面板据此回答「这个插件会对什么有反应」。
     #[serde(default)]
     pub subscribed_events: Vec<String>,
+    /// 本插件**处理的命令名**（`Contribution::Command` 的进程内等价物）。
+    ///
+    /// 空 = 不处理任何命令。面板据此回答「这个命令是谁在处理」，也让"命令
+    /// 无人处理"这类问题一眼可见（插件被禁用 → 这里空了）。
+    #[serde(default)]
+    pub handled_commands: Vec<String>,
+    /// 本插件贡献的**提示词块键**（`Contribution::Text` 的进程内等价物）。
+    ///
+    /// 只是声明（`key`），文本在装配时按上下文产生。空 = 不贡献。
+    #[serde(default)]
+    pub text_blocks: Vec<String>,
 }
 
 /// 插件的**定义来源**（面板技术信息展示用）。
@@ -142,6 +153,8 @@ impl From<&PluginManifest> for PluginDescriptor {
             optional_services: Vec::new(),
             pending_services: Vec::new(),
             subscribed_events: Vec::new(),
+            handled_commands: Vec::new(),
+            text_blocks: Vec::new(),
         }
     }
 }
@@ -578,6 +591,74 @@ impl PluginRegistry {
         delivered
     }
 
+    /// **分发一条命令**给声明了它的插件（`Contribution::Command`）。
+    ///
+    /// 返回：
+    /// - `Some(Ok(v))` —— 某个插件处理了；
+    /// - `Some(Err(e))` —— 某个插件认识但处理失败（`e` 原样给调用方）；
+    /// - `None` —— **没有**任何已挂载插件声明这个命令（调用方走默认分支，
+    ///   或在"本该有人处理"时回明确错误）。
+    ///
+    /// 只问**已挂载**的插件：插件被禁用/卸载后命令自动回到无人处理状态——
+    /// 这正是"命令域归插件"该有的语义，不需要在 dispatch 处特判。
+    ///
+    /// 多个插件声明同一命令时按**注册序**取第一个真的处理了它的（插件可以用
+    /// `handle_command` 返回 `None` 让位）。生产者侧应该避免这种重叠，这里
+    /// 的行为只是"不至于崩"。
+    pub fn dispatch_command(
+        &self,
+        name: &str,
+        payload: &serde_json::Value,
+    ) -> Option<Result<serde_json::Value, String>> {
+        for id in self.mounted_ids() {
+            let Some(plugin) = self.plugin(&id) else {
+                continue;
+            };
+            if !plugin.handled_commands().iter().any(|cmd| cmd == name) {
+                continue;
+            }
+            if let Some(outcome) = plugin.handle_command(name, payload) {
+                return Some(outcome);
+            }
+        }
+        None
+    }
+
+    /// 收集所有已挂载插件贡献的文本块（按 `order` 升序，等值按注册序）。
+    ///
+    /// `context` 原样透传给插件；返回值里的文本已是**内容**（不是声明）。
+    /// **内容为空的块会被丢掉**——"这个上下文下没话说"与"贡献一个空块"不是
+    /// 一回事，让调用方少一层判空。
+    pub fn collect_text_blocks(
+        &self,
+        context: &serde_json::Value,
+    ) -> Vec<(crate::PluginTextBlock, String)> {
+        let mut out: Vec<(crate::PluginTextBlock, String)> = Vec::new();
+        for id in self.mounted_ids() {
+            let Some(plugin) = self.plugin(&id) else {
+                continue;
+            };
+            for block in plugin.text_blocks() {
+                if let Some(text) = plugin.text_block_content(&block.key, context) {
+                    if !text.trim().is_empty() {
+                        out.push((block, text));
+                    }
+                }
+            }
+        }
+        // 稳定排序：`sort_by_key` 稳定，等值保持注册序。
+        out.sort_by_key(|(block, _)| block.order);
+        out
+    }
+
+    /// 某条命令当前由谁处理（诊断/测试用；`None` = 无人处理）。
+    pub fn command_owner(&self, name: &str) -> Option<String> {
+        self.mounted_ids().into_iter().find(|id| {
+            self.plugin(id)
+                .is_some_and(|p| p.handled_commands().iter().any(|cmd| cmd == name))
+        })
+    }
+
     /// 本注册表距树根的深度（裸注册表 = 0）。
     fn depth(&self) -> usize {
         self.tree_handle().map(|scope| scope.depth()).unwrap_or(0)
@@ -832,6 +913,9 @@ impl PluginRegistry {
                 d.optional_services = inject.optional.clone();
                 d.pending_services = pending.get(&id).cloned().unwrap_or_default();
                 d.subscribed_events = p.subscribed_events();
+                d.handled_commands = p.handled_commands();
+                // 只问**声明**（键），不碰内容——所以描述符生成是纯读操作。
+                d.text_blocks = p.text_blocks().into_iter().map(|b| b.key).collect();
                 if let Some(origin) = origins.get(&id) {
                     d.config_origin = origin.clone();
                 }
@@ -1533,5 +1617,212 @@ mod tests {
             vec!["sanitizer".to_string(), "extra".to_string()]
         );
         assert!(d.pending_services.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod command_text_block_tests {
+    use super::*;
+    use crate::manifest::PluginManifest;
+    use crate::plugin::{BuiltinPlugin, PluginTextBlock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 命令分发：只有声明过的名字被路由到，`None` = 无人处理。
+    #[test]
+    fn dispatch_routes_only_declared_commands() {
+        let reg = PluginRegistry::new();
+        reg.register(Arc::new(
+            BuiltinPlugin::new(
+                PluginManifest::builtin("cmd.a", "a", "1", "tool", "", ""),
+                |_| Ok(vec![]),
+            )
+            .with_commands(["DoThing", "Echo"])
+            .with_command_handler(|name, payload| match name {
+                "DoThing" => Some(Ok(serde_json::json!({"did": true}))),
+                "Echo" => Some(Ok(payload.clone())),
+                _ => None,
+            }),
+        ))
+        .unwrap();
+        reg.mount_all(&MountContext::new());
+
+        assert_eq!(reg.command_owner("DoThing").as_deref(), Some("cmd.a"));
+        let out = reg
+            .dispatch_command("DoThing", &serde_json::Value::Null)
+            .expect("已声明 → 有结果");
+        assert_eq!(out.unwrap()["did"], true);
+        // payload 原样透传（框架不解析内容）
+        let echoed = reg
+            .dispatch_command("Echo", &serde_json::json!({"n": 7}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed["n"], 7);
+        // 没声明 → None（调用方走默认分支）
+        assert!(reg
+            .dispatch_command("Unrelated", &serde_json::Value::Null)
+            .is_none());
+    }
+
+    /// 插件被禁用后命令自动回到"无人处理"——不在 dispatch 处特判。
+    #[test]
+    fn disabled_plugin_stops_owning_its_commands() {
+        let reg = PluginRegistry::new();
+        let ctx = MountContext::new();
+        reg.register(Arc::new(
+            BuiltinPlugin::new(
+                PluginManifest::builtin("cmd.b", "b", "1", "tool", "", ""),
+                |_| Ok(vec![]),
+            )
+            .with_commands(["DoThing"])
+            .with_command_handler(|_, _| Some(Ok(serde_json::Value::Null))),
+        ))
+        .unwrap();
+        reg.mount_all(&ctx);
+        assert!(reg
+            .dispatch_command("DoThing", &serde_json::Value::Null)
+            .is_some());
+
+        reg.set_enabled("cmd.b", false, &ctx).unwrap();
+        assert!(reg.command_owner("DoThing").is_none());
+        assert!(reg
+            .dispatch_command("DoThing", &serde_json::Value::Null)
+            .is_none());
+    }
+
+    /// 多个声明者：第一个**真的处理了**的胜出（返回 None 的让位）。
+    #[test]
+    fn later_declarer_takes_over_when_the_first_declines() {
+        let reg = PluginRegistry::new();
+        for (id, answer) in [("cmd.first", None), ("cmd.second", Some("second"))] {
+            reg.register(Arc::new(
+                BuiltinPlugin::new(PluginManifest::builtin(id, id, "1", "tool", "", ""), |_| {
+                    Ok(vec![])
+                })
+                .with_commands(["Shared"])
+                .with_command_handler(move |_, _| answer.map(|a| Ok(serde_json::json!(a)))),
+            ))
+            .unwrap();
+        }
+        reg.mount_all(&MountContext::new());
+        let out = reg
+            .dispatch_command("Shared", &serde_json::Value::Null)
+            .expect("第二个应接住");
+        assert_eq!(out.unwrap(), "second");
+        // owner 仍报第一个（它声明了，只是让位）——诊断视图看的是声明关系
+        assert_eq!(reg.command_owner("Shared").as_deref(), Some("cmd.first"));
+    }
+
+    /// 处理失败原样传出（不是 panic，也不是静默吞掉）。
+    #[test]
+    fn command_errors_are_passed_through_verbatim() {
+        let reg = PluginRegistry::new();
+        reg.register(Arc::new(
+            BuiltinPlugin::new(
+                PluginManifest::builtin("cmd.err", "e", "1", "tool", "", ""),
+                |_| Ok(vec![]),
+            )
+            .with_commands(["Boom"])
+            .with_command_handler(|_, _| Some(Err("磁盘满了".into()))),
+        ))
+        .unwrap();
+        reg.mount_all(&MountContext::new());
+        let out = reg
+            .dispatch_command("Boom", &serde_json::Value::Null)
+            .expect("有人处理")
+            .unwrap_err();
+        assert_eq!(out, "磁盘满了");
+    }
+
+    /// 文本块：按 order 排序，等值按注册序；空内容被丢掉。
+    #[test]
+    fn text_blocks_are_collected_in_order_and_empties_dropped() {
+        let reg = PluginRegistry::new();
+        let mounted = Arc::new(AtomicUsize::new(0));
+        // 注册序：late(20) → early(10) → equal(10) → empty
+        for (id, key, order, text) in [
+            ("pm.late", "late", 20, Some("L")),
+            ("pm.early", "early", 10, Some("E")),
+            ("pm.equal", "equal", 10, Some("Q")),
+            ("pm.empty", "empty", 0, None),
+        ] {
+            let m = mounted.clone();
+            reg.register(Arc::new(
+                BuiltinPlugin::new(
+                    PluginManifest::builtin(id, id, "1", "tool", "", ""),
+                    move |_| {
+                        m.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![])
+                    },
+                )
+                .with_text_blocks([PluginTextBlock::new(key, key, order)])
+                .with_text_block_content(move |requested, _ctx| {
+                    (requested == key).then(|| text.unwrap_or_default().to_string())
+                }),
+            ))
+            .unwrap();
+        }
+        reg.mount_all(&MountContext::new());
+
+        let blocks = reg.collect_text_blocks(&serde_json::Value::Null);
+        let keys: Vec<&str> = blocks.iter().map(|(b, _)| b.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["early", "equal", "late"],
+            "order 升序 + 等值保持注册序"
+        );
+        assert!(
+            blocks.iter().all(|(_, text)| !text.is_empty()),
+            "空块应被丢掉"
+        );
+    }
+
+    /// 上下文原样透传：同一个块按不同会话给出不同文本。
+    #[test]
+    fn text_block_context_reaches_the_plugin_verbatim() {
+        let reg = PluginRegistry::new();
+        reg.register(Arc::new(
+            BuiltinPlugin::new(
+                PluginManifest::builtin("pm.ctx", "c", "1", "tool", "", ""),
+                |_| Ok(vec![]),
+            )
+            .with_text_blocks([PluginTextBlock::new("ctx", "上下文块", 0)])
+            .with_text_block_content(|_, ctx| {
+                // 插件自己解释上下文（框架不解释）
+                ctx.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| format!("当前会话 {s}"))
+            }),
+        ))
+        .unwrap();
+        reg.mount_all(&MountContext::new());
+
+        let a = reg.collect_text_blocks(&serde_json::json!({"session_id": "s1"}));
+        assert_eq!(a[0].1, "当前会话 s1");
+        let b = reg.collect_text_blocks(&serde_json::json!({"session_id": "s2"}));
+        assert_eq!(b[0].1, "当前会话 s2");
+        // 没有上下文 → 插件返回 None → 块被丢掉
+        assert!(reg.collect_text_blocks(&serde_json::Value::Null).is_empty());
+    }
+
+    /// descriptor 暴露声明（面板可见「谁处理哪些命令 / 贡献哪些块」）。
+    #[test]
+    fn descriptors_expose_commands_and_text_block_keys() {
+        let reg = PluginRegistry::new();
+        reg.register(Arc::new(
+            BuiltinPlugin::new(
+                PluginManifest::builtin("pm.desc", "d", "1", "tool", "", ""),
+                |_| Ok(vec![]),
+            )
+            .with_commands(["A", "B"])
+            .with_text_blocks([
+                PluginTextBlock::new("k1", "区块一", 0),
+                PluginTextBlock::new("k2", "区块二", 5),
+            ])
+            .with_text_block_content(|_, _| Some("x".into())),
+        ))
+        .unwrap();
+        let d = &reg.descriptors()[0];
+        assert_eq!(d.handled_commands, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(d.text_blocks, vec!["k1".to_string(), "k2".to_string()]);
     }
 }

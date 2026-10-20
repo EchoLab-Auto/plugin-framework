@@ -206,6 +206,37 @@ impl Inject {
     }
 }
 
+/// 插件贡献的一块**有序文本**（宿主装配提示词/文档等"拼接型内容"时收集）。
+///
+/// 框架不知道"提示词"是什么——它只知道"有一个键、一个标题、一段文本、一个
+/// 顺序"。宿主的装配逻辑按 `order` 排序、按 `key` 去重即可。
+///
+/// 为什么内容在运行期取（而不是挂在 [`Contribution::Text`] 上）：同一插件
+/// 可能因上下文不同给出不同文本（典型场景：宿主按"当前是哪个会话"拼不同的
+/// 上下文段落）。声明只固定身份与顺序，文本按需产生。
+///
+/// [`Contribution::Text`]: echo_plugin_api::Contribution::Text
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginTextBlock {
+    /// 块键（去重/覆盖用；建议 `<插件>:<块名>`）。
+    pub key: String,
+    /// 展示标题（空 = 用 `key`）。
+    pub label: String,
+    /// 排序权重（小在前）。
+    pub order: i32,
+}
+
+impl PluginTextBlock {
+    /// 造一个声明。
+    pub fn new(key: impl Into<String>, label: impl Into<String>, order: i32) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            order,
+        }
+    }
+}
+
 /// A mountable plugin.
 pub trait Plugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
@@ -259,6 +290,48 @@ pub trait Plugin: Send + Sync {
         Ok(())
     }
 
+    /// 本插件**处理哪些命令**（默认空 = 不处理）。名字是宿主词汇。
+    ///
+    /// 宿主的分发路径：先问注册表"这个命令谁处理"，再落自己的默认分支。
+    /// 于是"某个命令域归某个插件"是**注册关系**而不是硬编码分支——插件不在，
+    /// 命令自然无人处理（宿主回明确错误，不是静默超时）。
+    fn handled_commands(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// 处理一条命令（默认 `None` = 我不认识这个命令）。
+    ///
+    /// 返回 `Some(Ok(v))` = 我处理了，结果在这里；`Some(Err(e))` = 我认识但
+    /// 处理失败（宿主把 `e` 原样回给前端）；`None` = 不归我管（宿主继续找）。
+    ///
+    /// 参数与返回值都是自由 JSON：命令类型是宿主与插件之间的契约，框架不搬。
+    fn handle_command(
+        &self,
+        name: &str,
+        payload: &serde_json::Value,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let _ = (name, payload);
+        None
+    }
+
+    /// 本插件贡献的**文本块声明**（键 / 标题 / 顺序；默认空）。
+    ///
+    /// 只做声明、**不产生文本**——因此可以在任何时刻调用（面板列举、宿主
+    /// 装配前预判顺序），不会因为上下文缺失而给出错误内容。
+    fn text_blocks(&self) -> Vec<PluginTextBlock> {
+        Vec::new()
+    }
+
+    /// 取某个块的**文本**（`None` = 这个上下文下没有内容）。
+    ///
+    /// `context` 是宿主给的上下文（自由 JSON；如 `{"session_id": "..."}`）——
+    /// 框架不解释它，只负责透传。这正是"声明"与"内容"分开的原因：同一个块在
+    /// 不同会话下可以给出不同文本。
+    fn text_block_content(&self, key: &str, context: &serde_json::Value) -> Option<String> {
+        let _ = (key, context);
+        None
+    }
+
     /// 硬依赖的键（[`Self::inject`] 的便捷读法：`self.inject().required`）。
     ///
     /// 保留它是**兼容 v0.5.0 的接缝**：那一版只有 `required_services`，
@@ -276,6 +349,10 @@ pub struct BuiltinPlugin {
     inject: Inject,
     subscriptions: Vec<String>,
     event_handler: Option<EventHandler>,
+    commands: Vec<String>,
+    command_handler: Option<CommandHandler>,
+    text_blocks: Option<TextBlockSource>,
+    text_content: Option<TextContentSource>,
 }
 
 /// 事件处理闭包（`BuiltinPlugin::with_event_handler` 的入参）。
@@ -283,6 +360,19 @@ pub struct BuiltinPlugin {
 /// 别名只为让字段声明可读（裸 `Option<Box<dyn Fn(..) -> Result<..>>>` 会被
 /// clippy 判"类型过于复杂"）。
 type EventHandler = Box<dyn Fn(&crate::PluginEvent) -> Result<(), String> + Send + Sync>;
+
+/// 命令处理闭包（`BuiltinPlugin::with_command_handler` 的入参）。
+///
+/// 返回语义与 [`Plugin::handle_command`] 一致：`None` = 不认识，交给下一个。
+type CommandHandler = Box<
+    dyn Fn(&str, &serde_json::Value) -> Option<Result<serde_json::Value, String>> + Send + Sync,
+>;
+
+/// 提示词块声明来源（`BuiltinPlugin::with_text_blocks` 的入参）。
+type TextBlockSource = Box<dyn Fn() -> Vec<PluginTextBlock> + Send + Sync>;
+
+/// 提示词块内容来源（`BuiltinPlugin::with_text_block_content` 的入参）。
+type TextContentSource = Box<dyn Fn(&str, &serde_json::Value) -> Option<String> + Send + Sync>;
 
 impl BuiltinPlugin {
     pub fn new(
@@ -295,6 +385,10 @@ impl BuiltinPlugin {
             inject: Inject::default(),
             subscriptions: Vec::new(),
             event_handler: None,
+            commands: Vec::new(),
+            command_handler: None,
+            text_blocks: None,
+            text_content: None,
         }
     }
 
@@ -314,6 +408,50 @@ impl BuiltinPlugin {
         f: impl Fn(&crate::PluginEvent) -> Result<(), String> + Send + Sync + 'static,
     ) -> Self {
         self.event_handler = Some(Box::new(f));
+        self
+    }
+
+    /// 声明本插件处理哪些命令，并附带处理闭包（见 [`Plugin::handle_command`]）。
+    ///
+    /// 两个参数分开是因为**声明可以先于实现**：宿主在装配期就能看到"这个插件
+    /// 处理哪些命令"（面板展示 / 冲突检测），而闭包可以稍后接线。
+    pub fn with_commands<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.commands = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// 附带命令处理闭包（返回 `None` = 不认识，交给下一个处理者）。
+    pub fn with_command_handler(
+        mut self,
+        f: impl Fn(&str, &serde_json::Value) -> Option<Result<serde_json::Value, String>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.command_handler = Some(Box::new(f));
+        self
+    }
+
+    /// 声明提示词块（见 [`Plugin::text_blocks`]）。
+    pub fn with_text_blocks<I>(mut self, blocks: I) -> Self
+    where
+        I: IntoIterator<Item = PluginTextBlock>,
+    {
+        let blocks: Vec<PluginTextBlock> = blocks.into_iter().collect();
+        self.text_blocks = Some(Box::new(move || blocks.clone()));
+        self
+    }
+
+    /// 附带提示词块**内容**来源（见 [`Plugin::text_block_content`]）。
+    pub fn with_text_block_content(
+        mut self,
+        f: impl Fn(&str, &serde_json::Value) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.text_content = Some(Box::new(f));
         self
     }
 
@@ -356,5 +494,28 @@ impl Plugin for BuiltinPlugin {
             Some(handler) => handler(event),
             None => Ok(()),
         }
+    }
+
+    fn handled_commands(&self) -> Vec<String> {
+        self.commands.clone()
+    }
+
+    fn handle_command(
+        &self,
+        name: &str,
+        payload: &serde_json::Value,
+    ) -> Option<Result<serde_json::Value, String>> {
+        self.command_handler.as_ref()?(name, payload)
+    }
+
+    fn text_blocks(&self) -> Vec<PluginTextBlock> {
+        match &self.text_blocks {
+            Some(source) => source(),
+            None => Vec::new(),
+        }
+    }
+
+    fn text_block_content(&self, key: &str, context: &serde_json::Value) -> Option<String> {
+        self.text_content.as_ref()?(key, context)
     }
 }

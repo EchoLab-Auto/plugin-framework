@@ -4,6 +4,43 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.8.0] — 2026-11-01
+
+补上最后两类"声明了没人读"的贡献：**命令处理**与**有序文本块**。至此协议里
+的六类贡献（Tool / Skill / Service / Events / PluginInstance / Command / Text）
+在 inproc 轨上都有真实消费方。
+
+### 新增 — 命令处理（`Contribution::Command`）
+
+- `CommandContribution { name, description }`：插件声明"这些命令我来处理"。
+  命令名是**宿主词汇**（如 `RequestXxx`），框架只搬不解释。
+- `Plugin::handled_commands()` + `Plugin::handle_command(name, payload)`：
+  返回 `Some(Ok(v))` 处理了 / `Some(Err(e))` 认识但失败 / `None` 不认识。
+- `PluginRegistry::dispatch_command()`：按注册序问已挂载插件；`None` = 无人
+  处理（调用方走默认分支）。**只问已挂载的插件**——插件被禁用后命令自动回到
+  "无人处理"，不需要在 dispatch 处特判。
+- `PluginRegistry::command_owner()`：诊断用（某条命令当前归谁）。
+- `PluginDescriptor.handled_commands`：面板能回答「这条命令谁在处理」。
+
+### 新增 — 有序文本块（`Contribution::Text`）
+
+- `TextBlockContribution { key, label, order }`：只声明**身份与顺序**。
+- `Plugin::text_blocks()`（声明）+ `Plugin::text_block_content(key, context)`
+  （内容）——**两个方法分开是有意的**：描述符生成要能随时调用（纯读、无副
+  作用），而内容依赖上下文（同一块在不同会话下可以不同）。
+- `PluginRegistry::collect_text_blocks(context)`：收集已挂载插件的块，按
+  `order` 升序（等值保持注册序），**内容为空的块被丢掉**。
+- `PluginDescriptor.text_blocks`：面板能回答「这个插件贡献了哪些段落」。
+
+### 为什么叫 `Text` 而不是 `Prompt`
+
+本仓的 `framework-gates` 有一条"框架层不得出现应用领域词汇"的门禁，词表里
+就有 `prompt`。这不是文字游戏：**框架确实不该知道文本会被拿去拼系统提示词**。
+叫 `Text` 之后，任何"拼接有序文本"的宿主场景（提示词、文档、报告）都能用同一
+套机制，而框架一行都不用改。
+
+> 这条门禁在本轮当场抓到了第一版命名（`Contribution::Prompt`）——说明它有用。
+
 ## [0.7.0] — 2026-11-01
 
 补上 `Contribution::Events` 的**进程内**那一半——它一直"声明了没人读"
@@ -44,6 +81,7 @@
 `reconcile`）看不到通过 `provide` 注册的服务。现在两条路径都走 `publish`。
 +1 测试（`typed_provide_broadcasts_like_register`）。
 
+[0.8.0]: #080--2026-11-01
 [0.7.0]: #070--2026-11-01
 [0.6.1]: #061--2026-11-01
 

@@ -24,9 +24,12 @@
 子作用域遮蔽父服务）。对应 dsh 的 `inject` / `ctx.plugin()` / `ctx.isolate()`。
 事件双向通道（v0.7.0）：插件侧 `MountContext::emit`、宿主侧
 `Plugin::subscribed_events` / `on_event` + `PluginRegistry::deliver_event`。
+命令与文本块（v0.8.0）：`Plugin::handled_commands` / `handle_command` +
+`PluginRegistry::dispatch_command`（命令域归插件），`Plugin::text_blocks` /
+`text_block_content` + `collect_text_blocks`（有序文本拼接）。
 
 ```bash
-cargo test --workspace   # 195 项
+cargo test --workspace   # 202 项
 ```
 
 **它能被别的应用用吗？** 这是唯一有意义的问题，所以有一个可执行的证伪测试：

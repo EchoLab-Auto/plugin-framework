@@ -22,6 +22,27 @@ pub enum Contribution {
     /// 作为别名接受，未来若要换 tag 有过渡窗口。
     #[serde(rename = "adapter", alias = "plugin_instance")]
     PluginInstance(InstanceContribution),
+    /// **命令处理**贡献（v0.8.0）：插件声明"这些命令我来处理"。
+    ///
+    /// 宿主原本只能靠一个封闭 `enum` + 巨型 `match` 分发命令（EchoAgent 里
+    /// 是 66 个变体 / 2,068 行）。有了它，"某个命令域归某个插件"就从**硬编码
+    /// 分支**变成**注册关系**——插件不在，命令自然无人处理，宿主回明确错误。
+    ///
+    /// 框架只搬 `name`：命令名是**宿主词汇**（如 `RequestWorkspaceSessions`），
+    /// 框架不认识也不解释。
+    Command(CommandContribution),
+    /// **提示词块**贡献（v0.8.0）：插件声明要向宿主的"文本装配"过程贡献一段
+    /// 文本（带顺序与标题）。
+    ///
+    /// 宿主原本只能给装配函数加参数（"收集上下文段落"这类函数每来一个要注入
+    /// 内容的插件就改一次签名）。有了它，装配变成"收集已注册的块 + 排序"，
+    /// 与插件数量解耦。
+    ///
+    /// 框架只搬 `key`（槽内唯一），`label` / `text` 由 [`PluginTextBlock`]
+    /// 在运行期给出——**框架不知道"提示词"是什么**，它只知道"有序文本块"。
+    ///
+    /// [`PluginTextBlock`]: echo_plugin::PluginTextBlock
+    Text(TextBlockContribution),
 }
 
 fn default_category() -> String {
@@ -95,6 +116,37 @@ pub struct ServiceContribution {
 pub struct EventContribution {
     #[serde(default)]
     pub subscribe: Vec<String>,
+}
+
+/// 命令处理声明（`Contribution::Command`）。
+///
+/// 只有名字：**处理逻辑在插件侧**（inproc 走 `Plugin::handle_command`，stdio
+/// 走 `Invoke("<name>")`）。框架不搬载荷类型、不做 schema 校验——那都是宿主
+/// 与插件之间的契约。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandContribution {
+    /// 命令名（宿主词汇；同一个名字只应有一个处理者）。
+    pub name: String,
+    /// 人读说明（面板展示用；空 = 只显示名字）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// 提示词块声明（`Contribution::Text`）。
+///
+/// 与 [`CommandContribution`] 同款：这里只有**身份与顺序**，文本在运行期由
+/// `Plugin::text_blocks(context)` 按需产生（同一个插件可能因会话不同而给出
+/// 不同内容）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextBlockContribution {
+    /// 块键（宿主装配时用于去重/覆盖；建议 `<插件>:<块名>`）。
+    pub key: String,
+    /// 面板展示用的标题（空 = 用 `key`）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// 排序权重（小在前；等值按注册序）。
+    #[serde(default)]
+    pub order: i32,
 }
 
 /// 插件实例贡献（P1，2026-10 实例插件化）：宿主把 `RemoteInstance` 注册进

@@ -394,6 +394,10 @@ fn contribution_target(contribution: &Contribution) -> Option<String> {
         Contribution::Events(_) => None,
         // 插件实例贡献的寻址名 = 实例名（宿主按 `Invoke("<name>:<op>")` 寻址）。
         Contribution::PluginInstance(instance) => Some(instance.name.clone()),
+        // 命令处理贡献的寻址名 = 命令名（宿主按 `Invoke("<command>")` 下发）。
+        Contribution::Command(command) => Some(command.name.clone()),
+        // 提示词块是"宿主来取"而不是"宿主来调"（拉模式），不参与寻址。
+        Contribution::Text(_) => None,
     }
 }
 
