@@ -18,6 +18,9 @@
 //!   declaration merging): any new event type is a new `Event` implementor.
 //! - [`ScopedRegistry`] — name-keyed registrations with per-scope shadowing:
 //!   a scoped entry replaces its same-named global twin for that scope alone.
+//! - **父子作用域**：[`Ctx::child`] 造一个父链子作用域（子遮蔽父、父对其可见），
+//!   变更通知 [`Ctx::on_change`] 沿父链向上传播，等待 [`Ctx::wait_for_keys`]
+//!   在整个家族内共享唤醒源——这是插件树（父插件宿主化子插件）的底座。
 //!
 //! # 全局态不在此（v0.3.0）
 //!
@@ -34,7 +37,7 @@ mod event;
 mod scope;
 mod service_key;
 
-pub use ctx::{Ctx, Disposer, ServiceError};
+pub use ctx::{Change, Ctx, Disposer, ServiceError};
 pub use event::{DispatchMode, Event, EventBus, WaterfallDecision};
 pub use scope::ScopedRegistry;
 pub use service_key::ServiceKey;

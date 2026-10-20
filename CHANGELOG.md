@@ -4,6 +4,71 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.6.0] — 2026-11-01
+
+两块缺失的 dsh 语义补齐：**声明式 `inject` + 就绪等待**，以及**插件树 / 父 ctx**
+（父插件宿主化子插件、卸载级联）。v0.5.0 的 `required_services` 升级为完整的
+注入声明，旧写法继续生效（默认实现读 `inject().required`）。
+
+### 新增 — 声明式注入
+
+- `Inject { required, optional }`（`echo-plugin`）：
+  - `required` 缺失 → 拒绝挂载（`PluginMountError::MissingService`，**mount
+    闭包不执行**）；
+  - `optional` 只作声明（面板展示 / 宿主按需读），**不参与**挂载判定。
+- `Plugin::inject()` 是唯一真值；`Plugin::required_services()` 降为
+  `inject().required` 的便捷读法（兼容 v0.5.0 的覆写者）。
+- `BuiltinPlugin::with_inject` / `with_required_services`（后者等价于
+  `with_inject(Inject::new(..))`）。
+- `PluginDescriptor` 新增 `optional_services` / `pending_services`
+  （`#[serde(default)]`）：面板能回答「它要什么」与「此刻还缺什么」——后者与
+  `error` 不同，是"事实"而非"上次尝试的结果"。
+
+### 新增 — 就绪等待与依赖变更
+
+- `Ctx::wait_for_keys(&[String], timeout)`（`echo-context`）：等一组键**全部**
+  就绪，命中立即返回、超时给 `ServiceError::Missing{key, available}`。
+- `PluginRegistry::mount_when_ready(id, ctx, timeout)`：
+  **先等后挂**（不是"失败后重试"），中间不留空窗；`timeout = ZERO` 等价于
+  `mount`。
+- `PluginRegistry::mount_all_when_ready(ctx, timeout)`：启动期按注册顺序批量
+  等待挂载。
+- `PluginRegistry::reconcile(&ctx) -> ReconcileReport`：依赖变动后重新核对——
+  pending 里依赖已齐的挂上、已挂载但依赖消失的卸下并重新进 pending。**只看
+  事实不看意图**：人主动禁用的、从没挂过也没 pending 记录的，一律不动。
+- `PluginRegistry::pending_inject()`：`id → 缺的键`，面板"待挂载"视图用。
+
+### 新增 — 插件树 / 父 ctx（dsh `ctx.plugin()` 的对应物）
+
+- `Ctx::child()` / `parent()` / `depth()`：**父子作用域**。父链继承、子遮蔽父、
+  子注册对父不可见。`resolve` / `contains` / `keys` / `service` 全部沿父链查找。
+- `Ctx::on_change(f) -> Disposer` + `Change::{Provided, Disposed}`：变更通知
+  **沿父链向上传播**（根能看见整棵子树）；等待在**整个家族内共享唤醒源**
+  （子等父提供的服务不会漏唤醒）。
+- `PluginScope`（新模块 `scope`）：一层 = 一个 `Ctx` 作用域 + 一个
+  `PluginRegistry`。`PluginScope::root(ctx)` 建根，`mount` / `mount_when_ready`
+  / `unmount` / `shutdown` / `walk` / `children_of`。
+- `MountContext::nest()` / `MountContext::tree`：插件在自己的 `mount` 里建
+  **子作用域**并挂子插件。归属靠挂载期压栈记录（`mounting` 栈），不靠插件自报；
+  `unmount(父)` 会 `shutdown()` 它名下的子作用域（**递归**，子先于父）。
+- 无树把手的裸注册表：`nest()` 返回 `None`，挂载照常成功——树是**可选**能力。
+
+### 修复
+
+- **`Plugin::unmount()` 此前从未被调用**：`PluginRegistry::unmount` 撤完
+  disposer 就返回，插件覆写的 `unmount`（"disposer 之外的清理"）成了死代码。
+  现在 disposer 撤完会调用它。顺带把 disposer 撤销顺序改成**逆序**（后注册的
+  先撤），与嵌套资源直觉一致。
+- `Ctx::register` 的 disposer 此前直接改表、不广播：现在走
+  `remove_and_wake`，订阅者与等待者都能看见"注销"。
+
+### 为什么不把 inject 类型化
+
+服务键的**存在性**是 `echo-context` 的概念；键背后的类型是宿主与插件的私事。
+框架若要求类型化，就得认识宿主的 trait（`echo-plugin` 零领域依赖的边界立刻破），
+或者要求插件之间互相 `use` 对方的类型（插件就不再可独立替换）。存在性校验已
+覆盖真实故障：注册顺序错、服务忘了注册、服务被提前注销。
+
 ## [0.5.0] — 2026-11-01
 
 补上 in-process 插件缺失的两块机制：**配置下发**与**服务键依赖校验**。
@@ -37,6 +102,7 @@
 组合根把服务注册挪到挂载之后、或忘了注册——启动期立刻失败并列出可用服务，
 而不是"插件挂载成功、运行期才发现依赖不存在"。
 
+[0.6.0]: #060--2026-11-01
 [0.5.0]: #050--2026-11-01
 
 ## [0.4.1] — 2026-10-19

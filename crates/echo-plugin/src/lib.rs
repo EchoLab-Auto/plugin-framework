@@ -15,7 +15,11 @@
 pub mod manifest;
 pub mod plugin;
 pub mod registry;
+pub mod scope;
 
 pub use manifest::{PluginError, PluginManifest, PluginRuntime};
-pub use plugin::{BuiltinPlugin, MountContext, Plugin, PluginMountError, PluginMountResult};
-pub use registry::{PluginDefinition, PluginDescriptor, PluginRegistry};
+pub use plugin::{
+    BuiltinPlugin, Inject, MountContext, Plugin, PluginMountError, PluginMountResult,
+};
+pub use registry::{PluginDefinition, PluginDescriptor, PluginRegistry, ReconcileReport};
+pub use scope::PluginScope;

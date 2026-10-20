@@ -18,8 +18,13 @@
 | [`echo-plugin-sdk`](./crates/echo-plugin-sdk) | **插件侧运行时**：帧读写、握手、serve 循环、宿主回呼 |
 | [`framework-gates`](./crates/framework-gates) | 仓库自守门禁（不反向依赖宿主 / 零全局态 / 领域无关） |
 
+**插件语义（v0.6.0）**：`Inject`（声明式依赖：硬依赖缺失即拒绝挂载、软依赖只作
+声明）+ `mount_when_ready`（先等后挂）+ `reconcile`（依赖变更 → 重挂/卸下）+
+`PluginScope` / `MountContext::nest`（插件树：父插件宿主化子插件，卸载级联、
+子作用域遮蔽父服务）。对应 dsh 的 `inject` / `ctx.plugin()` / `ctx.isolate()`。
+
 ```bash
-cargo test --workspace   # 162 项
+cargo test --workspace   # 188 项
 ```
 
 **它能被别的应用用吗？** 这是唯一有意义的问题，所以有一个可执行的证伪测试：

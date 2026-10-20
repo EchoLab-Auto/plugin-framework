@@ -78,7 +78,7 @@ pub struct PluginDescriptor {
     /// 密钥，上协议即等于把它们送到前端内存与日志里。
     #[serde(default)]
     pub env_keys: Vec<String>,
-    /// 本插件**要求的服务键**（`Ctx` 命名空间；空 = 无要求）。
+    /// 本插件**要求的服务键**（`Inject::required`；空 = 无要求）。
     ///
     /// 面板据此回答「这个插件为什么不挂载」：注册表在 mount 前逐个
     /// `Ctx::contains` 校验，缺失即 [`PluginMountError::MissingService`]，
@@ -86,6 +86,15 @@ pub struct PluginDescriptor {
     /// 同层——都是"排查挂载失败需要的信息"。
     #[serde(default)]
     pub required_services: Vec<String>,
+    /// 本插件声明的**软依赖**（`Inject::optional`；缺失不阻止挂载）。
+    #[serde(default)]
+    pub optional_services: Vec<String>,
+    /// 眼下**还缺**的硬依赖（空 = 不缺）。
+    ///
+    /// 与 `error` 的区别：`error` 是"挂载尝试的结果"，这里是"此刻的事实"
+    /// ——依赖恢复后 [`PluginRegistry::reconcile`] 会把插件挂上并清空它。
+    #[serde(default)]
+    pub pending_services: Vec<String>,
 }
 
 /// 插件的**定义来源**（面板技术信息展示用）。
@@ -125,6 +134,43 @@ impl From<&PluginManifest> for PluginDescriptor {
             args: Vec::new(),
             env_keys: Vec::new(),
             required_services: Vec::new(),
+            optional_services: Vec::new(),
+            pending_services: Vec::new(),
+        }
+    }
+}
+
+/// [`PluginRegistry::reconcile`] 的结果：这一轮动了什么。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// 依赖到位后被挂上的插件。
+    pub mounted: Vec<String>,
+    /// 依赖消失后被卸下的插件。
+    pub unmounted: Vec<String>,
+    /// 依赖已齐但挂载失败（闭包报错）的插件 `(id, 错误)`。
+    ///
+    /// 与"缺依赖"分开：这是插件自己的 bug，不会被下一次 reconcile 自动重试
+    /// （它已经不在 pending 里了）——否则会变成静默的失败循环。
+    pub failed: Vec<(String, String)>,
+}
+
+impl ReconcileReport {
+    /// 这一轮是否什么都没变（调用方据此决定要不要打日志/推事件）。
+    pub fn is_noop(&self) -> bool {
+        self.mounted.is_empty() && self.unmounted.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// 「当前正在挂载的插件」栈的 guard：drop 时弹栈（含 panic 展开路径）。
+struct OwnerGuard {
+    tree: Option<Arc<crate::PluginScope>>,
+    id: String,
+}
+
+impl Drop for OwnerGuard {
+    fn drop(&mut self) {
+        if let Some(tree) = &self.tree {
+            tree.links_leave(&self.id);
         }
     }
 }
@@ -152,6 +198,16 @@ pub struct PluginRegistry {
     /// 插件 id → 「定义从哪来 / 怎么启动」（展示用；见
     /// [`PluginRegistry::set_definition`]）。
     definitions: std::sync::Mutex<BTreeMap<String, PluginDefinition>>,
+    /// 本注册表所属的**树作用域**（弱引用；`PluginScope` 建时注入）。
+    ///
+    /// 用弱引用是为了不制造 `scope → registry → scope` 的 Arc 环：作用域
+    /// 由调用方持有，注册表只借它做「归属记录 + 级联卸载」。
+    tree: std::sync::Mutex<Option<std::sync::Weak<crate::PluginScope>>>,
+    /// 因**依赖未就绪**而没挂上的插件 → 当时缺的键。
+    ///
+    /// 与 `enabled_state = false`（人主动禁用）区分开：这些是"该挂、还没
+    /// 条件挂"，[`Self::reconcile`] 在依赖到位后会把它们挂上。
+    pending: std::sync::Mutex<BTreeMap<String, Vec<String>>>,
     /// 注册顺序（`descriptors()` 按它输出）。
     ///
     /// 为什么单独存：底层 `plugins` 是 `BTreeMap`（按 id 排序），而
@@ -226,59 +282,299 @@ impl PluginRegistry {
     ///
     /// [`Plugin::required_services`]: crate::Plugin::required_services
     pub fn mount(&self, id: &str, ctx: &MountContext) -> PluginMountResult {
-        let plugin = {
-            let plugins = self
-                .plugins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match plugins.get(id) {
-                Some(p) => Arc::clone(p),
-                None => {
-                    return Err(PluginMountError::Mount(format!(
-                        "plugin not registered: {id}"
-                    )))
-                }
+        let plugin = match self.plugin(id) {
+            Some(plugin) => plugin,
+            None => {
+                return Err(PluginMountError::Mount(format!(
+                    "plugin not registered: {id}"
+                )))
             }
         };
-        // 1) 依赖就绪（服务键）：缺失即拒绝挂载，且错误里带"有哪些可用"。
-        let required = plugin.required_services();
-        if !required.is_empty() {
-            let missing = match ctx.ctx.as_ref() {
-                Some(c) => required.iter().find(|key| !c.contains(key)).cloned(),
-                // 插件声明了服务依赖，但宿主没注入 Ctx——等同全部缺失。
-                None => required.first().cloned(),
-            };
-            if let Some(key) = missing {
-                let available = ctx.ctx.as_ref().map(|c| c.keys()).unwrap_or_default();
-                return Err(PluginMountError::MissingService { key, available });
-            }
+        // 1) 声明式注入（`inject.required`）：缺失即拒绝挂载，且错误里带
+        //    "有哪些可用"。**闭包一次都不执行**——依赖没就绪就不该产生副作用。
+        let inject = plugin.inject();
+        let missing = inject.missing(ctx.ctx.as_ref());
+        if let Some(key) = missing.first() {
+            let available = ctx.ctx.as_ref().map(|c| c.keys()).unwrap_or_default();
+            self.set_pending(id, missing.clone());
+            return Err(PluginMountError::MissingService {
+                key: key.clone(),
+                available,
+            });
         }
-        // 2) 本插件配置（未登记 = Null）。
+        // 2) 本插件配置（未登记 = Null）+ 树把手（作用域归属）。
         let plugin_ctx = MountContext {
             ctx: ctx.ctx.clone(),
             config: self.config_for(id),
+            tree: ctx.tree.clone(),
         };
-        let disposers = plugin.mount(&plugin_ctx)?;
+        // 3) 记录"当前正在挂载谁"：插件在 mount 里 `nest()` 出的子作用域
+        //    据此记在它名下，卸载它时级联卸载（dsh 的 ctx.plugin 语义）。
+        let owner = self.enter_owner(id);
+        let result = plugin.mount(&plugin_ctx);
+        drop(owner);
+        let disposers = result?;
+        // 逆序撤销（后注册的先撤）——与嵌套注册的直觉一致，也让"外层资源
+        // 在里层资源之后消失"这条约束自然成立。
         let mut active = self
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.insert(id.to_string(), disposers);
+        active.insert(id.to_string(), disposers.into_iter().rev().collect());
+        drop(active);
+        self.clear_pending(id);
+        self.set_plugin_error_cleared(id);
         Ok(Vec::new())
     }
 
     /// Deactivate a plugin: dispose all registrations (reversible effects).
+    ///
+    /// **级联**：该插件挂载期建出的子作用域（插件树）先被 `shutdown()`——
+    /// 子先于父，且子作用域自己的 ctx 随之丢弃（父链引用断掉）。没有树把手
+    /// 时（裸注册表挂载）就是单层卸载，行为与 v0.5.0 一致。
     pub fn unmount(&self, id: &str) -> Result<(), PluginMountError> {
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(mut disposers) = active.remove(id) {
+        // 子作用域先走：否则父的服务表先撤，子插件会看到"父服务突然消失"
+        // 这种半死状态（它的 unmount 可能还要用父服务）。
+        for child in self.take_child_scopes(id) {
+            child.shutdown();
+        }
+        let removed = {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active.remove(id)
+        };
+        if let Some(mut disposers) = removed {
             for d in disposers.drain(..) {
                 d.dispose();
             }
+            // `Plugin::unmount` = disposer 之外的清理（关文件、停线程…）。
+            // **2026-11 修**：此前从未被调用——disposer 撤完就返回，插件
+            // 覆写的 `unmount` 成了死代码。
+            if let Some(plugin) = self.plugin(id) {
+                plugin.unmount()?;
+            }
         }
         Ok(())
+    }
+
+    /// 挂载，但**先等注入就绪**（最多 `timeout`；dsh `inject` 的等待语义）。
+    ///
+    /// 与 [`Self::mount`] 的差别只有前置条件：`mount` 立即校验、缺失即失败
+    /// （组合根"要么现在行、要么启动失败"）；本方法把「暂时没到」当成可等
+    /// 待的事实，等到就挂、超时才失败。等待本身用
+    /// [`Ctx::wait_for_keys`]——先就绪后挂载，中间不留空窗。
+    ///
+    /// `timeout = Duration::ZERO` 等价于 [`Self::mount`]（只查一次）。
+    ///
+    /// [`Ctx::wait_for_keys`]: echo_context::Ctx::wait_for_keys
+    pub async fn mount_when_ready(
+        &self,
+        id: &str,
+        ctx: &MountContext,
+        timeout: std::time::Duration,
+    ) -> PluginMountResult {
+        let plugin = match self.plugin(id) {
+            Some(plugin) => plugin,
+            None => {
+                return Err(PluginMountError::Mount(format!(
+                    "plugin not registered: {id}"
+                )))
+            }
+        };
+        let required = plugin.inject().required;
+        if !required.is_empty() {
+            match ctx.ctx.as_ref() {
+                Some(cx) => cx.wait_for_keys(&required, timeout).await.map_err(|err| {
+                    let (key, available) = match err {
+                        echo_context::ServiceError::Missing { key, available } => (key, available),
+                        echo_context::ServiceError::Conflict { key } => (key, Vec::new()),
+                    };
+                    self.set_pending(id, vec![key.clone()]);
+                    PluginMountError::MissingService { key, available }
+                })?,
+                None => {
+                    self.set_pending(id, required.clone());
+                    return Err(PluginMountError::MissingService {
+                        key: required[0].clone(),
+                        available: Vec::new(),
+                    });
+                }
+            }
+        }
+        self.mount(id, ctx)
+    }
+
+    /// 按注册顺序批量挂载，每个都先等注入就绪（启动期用）。
+    ///
+    /// 返回 `(已挂载 id, 错误 (id, 描述))`。与 [`Self::mount_all`] 一样
+    /// "尽力而为"：某个插件失败不阻断其余——但依赖它的插件会因缺服务而一并
+    /// 记进 `pending`，等 [`Self::reconcile`] 收拾。
+    pub async fn mount_all_when_ready(
+        &self,
+        ctx: &MountContext,
+        timeout: std::time::Duration,
+    ) -> (Vec<String>, Vec<(String, String)>) {
+        let mut mounted = Vec::new();
+        let mut errors = Vec::new();
+        for id in self.ids() {
+            if !self.is_enabled(&id) {
+                continue;
+            }
+            match self.mount_when_ready(&id, ctx, timeout).await {
+                Ok(_) => mounted.push(id),
+                Err(e) => errors.push((id, e.to_string())),
+            }
+        }
+        (mounted, errors)
+    }
+
+    /// 依赖变更后**重新核对**：该挂的挂上、该卸的卸下（dsh 的 inject 响应）。
+    ///
+    /// 三类动作，只看"事实"不看"意图"：
+    ///
+    /// 1. **挂**：注册过、启用着、没挂载、且**记在 pending 里**（上次因缺
+    ///    依赖失败）的插件，其硬依赖现在齐了 → 挂上；
+    /// 2. **卸**：已挂载、但硬依赖**没了** → 卸下并记进 pending（等它回来）；
+    /// 3. 其余一律不动——尤其是"人主动禁用"的（`enabled_state = false`）与
+    ///    "从没挂过也没 pending 记录"的，都不会被顺手拉起。
+    ///
+    /// 幂等：没变化时是两次表扫描，无副作用。宿主可以在
+    /// [`Ctx::on_change`] 回调里直接调用（回调期间别重入即可，见
+    /// `PluginHost::reconcile` 的重入保护）。
+    ///
+    /// [`Ctx::on_change`]: echo_context::Ctx::on_change
+    pub fn reconcile(&self, ctx: &MountContext) -> ReconcileReport {
+        let mut report = ReconcileReport::default();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        // 1) pending 里依赖已齐的 → 挂
+        for id in pending {
+            if !self.is_enabled(&id) || self.is_mounted(&id) {
+                continue;
+            }
+            let Some(plugin) = self.plugin(&id) else {
+                continue;
+            };
+            let missing = plugin.inject().missing(ctx.ctx.as_ref());
+            if !missing.is_empty() {
+                self.set_pending(&id, missing);
+                continue;
+            }
+            match self.mount(&id, ctx) {
+                Ok(_) => report.mounted.push(id),
+                Err(e) => report.failed.push((id, e.to_string())),
+            }
+        }
+        // 2) 已挂载但硬依赖消失的 → 卸
+        for id in self.mounted_ids() {
+            let Some(plugin) = self.plugin(&id) else {
+                continue;
+            };
+            let missing = plugin.inject().missing(ctx.ctx.as_ref());
+            if missing.is_empty() {
+                continue;
+            }
+            if self.unmount(&id).is_ok() {
+                self.set_pending(&id, missing);
+                report.unmounted.push(id);
+            }
+        }
+        report
+    }
+
+    /// 当前**还缺**硬依赖的插件（`id → 缺的键`）；面板"待挂载"视图用。
+    pub fn pending_inject(&self) -> Vec<(String, Vec<String>)> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(id, keys)| (id.clone(), keys.clone()))
+            .collect()
+    }
+
+    /// 本注册表所属的树作用域（`PluginScope` 建时注入；裸注册表为 `None`）。
+    pub fn tree_handle(&self) -> Option<Arc<crate::PluginScope>> {
+        self.tree
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// 注入树作用域（`PluginScope::build` 调用一次）。
+    pub(crate) fn attach_tree(&self, tree: std::sync::Weak<crate::PluginScope>) {
+        *self
+            .tree
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tree);
+    }
+
+    /// 是否已挂载（`enabled` 是"用户想开"，这里问"实际挂着吗"）。
+    pub fn is_mounted(&self, id: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(id)
+    }
+
+    fn mounted_ids(&self) -> Vec<String> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn set_pending(&self, id: &str, missing: Vec<String>) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_string(), missing);
+    }
+
+    fn clear_pending(&self, id: &str) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    fn set_plugin_error_cleared(&self, id: &str) {
+        self.errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// 压栈"正在挂载的插件"，返回的 guard 在 drop 时弹栈（panic 安全）。
+    fn enter_owner(&self, id: &str) -> OwnerGuard {
+        if let Some(tree) = self.tree_handle() {
+            tree.links_enter(id);
+            OwnerGuard {
+                tree: Some(tree),
+                id: id.to_string(),
+            }
+        } else {
+            OwnerGuard {
+                tree: None,
+                id: id.to_string(),
+            }
+        }
+    }
+
+    fn take_child_scopes(&self, id: &str) -> Vec<Arc<crate::PluginScope>> {
+        match self.tree_handle() {
+            Some(tree) => tree.links_take_children(id),
+            None => Vec::new(),
+        }
     }
 
     /// Mount every registered plugin (starting-up). Plugins whose mount fails
@@ -426,11 +722,19 @@ impl PluginRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         for id in ids {
             if let Some(p) = plugins.get(&id) {
                 let mut d = PluginDescriptor::from(p.manifest());
                 d.enabled = states.get(&id).copied().unwrap_or(true);
-                d.required_services = p.required_services();
+                let inject = p.inject();
+                d.required_services = inject.required.clone();
+                d.optional_services = inject.optional.clone();
+                d.pending_services = pending.get(&id).cloned().unwrap_or_default();
                 if let Some(origin) = origins.get(&id) {
                     d.config_origin = origin.clone();
                 }
@@ -913,5 +1217,224 @@ mod tests {
             reg.descriptors()[0].required_services,
             vec!["loop".to_string(), "sanitizer".to_string()]
         );
+    }
+
+    // ── 声明式 inject：就绪等待 + 依赖变动重挂 ─────────────────────────
+
+    /// 造一个"要 `loop` 服务"的插件，挂载时记账。
+    fn needs_loop(
+        id: &str,
+        mounted: Arc<std::sync::atomic::AtomicUsize>,
+        unmounted: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<dyn Plugin> {
+        use std::sync::atomic::Ordering;
+        let manifest = PluginManifest::builtin(id, id, "1", "loop", "", "");
+        let plugin = BuiltinPlugin::new(manifest, move |_| {
+            mounted.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![])
+        })
+        .with_inject(crate::Inject::new(["loop"]));
+        struct WithUnmount {
+            inner: BuiltinPlugin,
+            unmounted: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Plugin for WithUnmount {
+            fn manifest(&self) -> &PluginManifest {
+                self.inner.manifest()
+            }
+            fn mount(&self, ctx: &MountContext) -> PluginMountResult {
+                self.inner.mount(ctx)
+            }
+            fn inject(&self) -> crate::Inject {
+                self.inner.inject()
+            }
+            fn unmount(&self) -> Result<(), PluginMountError> {
+                self.unmounted
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        Arc::new(WithUnmount {
+            inner: plugin,
+            unmounted,
+        })
+    }
+
+    /// `mount_when_ready`：服务晚到也能挂上（等到再挂，不留空窗）。
+    #[tokio::test]
+    async fn mount_when_ready_waits_for_the_service() {
+        let reg = PluginRegistry::new();
+        let mounted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        reg.register(needs_loop(
+            "w.w",
+            mounted.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ))
+        .unwrap();
+        let ctx = Arc::new(echo_context::Ctx::default());
+        let mctx = MountContext::new().with_ctx(ctx.clone());
+
+        // 100ms 后才提供 `loop`。
+        let provider = ctx.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _keep = provider.register::<u8>("loop", 1u8);
+            // 保持存活直到测试结束（把 disposer 泄在这儿不影响断言）
+            std::mem::forget(_keep);
+        });
+        let started = std::time::Instant::now();
+        reg.mount_when_ready("w.w", &mctx, std::time::Duration::from_secs(2))
+            .await
+            .expect("应该等到 loop 再挂上");
+        handle.await.unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(80),
+            "必须真的等过（而不是立即失败）"
+        );
+        assert_eq!(mounted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(reg.is_mounted("w.w"));
+        assert!(reg.pending_inject().is_empty(), "挂上后不该再有 pending");
+    }
+
+    /// 超时：`mount_when_ready` 等不到就失败，并记进 pending（面板可见）。
+    #[tokio::test]
+    async fn mount_when_ready_times_out_and_records_pending() {
+        let reg = PluginRegistry::new();
+        reg.register(needs_loop(
+            "w.slow",
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ))
+        .unwrap();
+        let mctx = MountContext::new().with_ctx(Arc::new(echo_context::Ctx::default()));
+        let err = reg
+            .mount_when_ready("w.slow", &mctx, std::time::Duration::from_millis(50))
+            .await;
+        match err {
+            Err(PluginMountError::MissingService { key, .. }) => assert_eq!(key, "loop"),
+            Err(other) => panic!("expected MissingService, got {other}"),
+            Ok(_) => panic!("expected MissingService, got Ok"),
+        }
+        assert_eq!(
+            reg.pending_inject(),
+            vec![("w.slow".to_string(), vec!["loop".to_string()])]
+        );
+        assert!(!reg.is_mounted("w.slow"));
+        // descriptor 里能看到 pending（面板据此显示"等 loop"）
+        let d = &reg.descriptors()[0];
+        assert_eq!(d.required_services, vec!["loop".to_string()]);
+        assert_eq!(d.pending_services, vec!["loop".to_string()]);
+    }
+
+    /// `timeout = ZERO` 等价于立即 mount（只查一次）。
+    #[tokio::test]
+    async fn zero_timeout_equals_immediate_check() {
+        let reg = PluginRegistry::new();
+        reg.register(needs_loop(
+            "w.zero",
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ))
+        .unwrap();
+        let mctx = MountContext::new().with_ctx(Arc::new(echo_context::Ctx::default()));
+        let err = reg
+            .mount_when_ready("w.zero", &mctx, std::time::Duration::ZERO)
+            .await;
+        assert!(matches!(err, Err(PluginMountError::MissingService { .. })));
+    }
+
+    /// `reconcile`：依赖到位 → 自动挂上；依赖消失 → 自动卸下。
+    ///
+    /// 这是 dsh `inject` 的完整语义（不只是启动期检查一次）。
+    #[test]
+    fn reconcile_mounts_when_deps_arrive_and_unmounts_when_they_leave() {
+        use std::sync::atomic::Ordering;
+        let reg = PluginRegistry::new();
+        let mounted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let unmounted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        reg.register(needs_loop("r.r", mounted.clone(), unmounted.clone()))
+            .unwrap();
+        let ctx = Arc::new(echo_context::Ctx::default());
+        let mctx = MountContext::new().with_ctx(ctx.clone());
+
+        // 1) 依赖缺失：首次挂载失败 → 进 pending；reconcile 无事可做。
+        assert!(reg.mount("r.r", &mctx).is_err());
+        assert!(reg.reconcile(&mctx).is_noop());
+        assert_eq!(mounted.load(Ordering::SeqCst), 0);
+
+        // 2) 服务到位 → reconcile 挂上。
+        let keep = ctx.register::<u8>("loop", 1u8);
+        let report = reg.reconcile(&mctx);
+        assert_eq!(report.mounted, vec!["r.r".to_string()]);
+        assert_eq!(mounted.load(Ordering::SeqCst), 1);
+        assert!(reg.pending_inject().is_empty());
+        // 幂等：再核一次什么都不动。
+        assert!(reg.reconcile(&mctx).is_noop());
+
+        // 3) 服务消失 → reconcile 卸下并重新进 pending。
+        keep.dispose();
+        let report = reg.reconcile(&mctx);
+        assert_eq!(report.unmounted, vec!["r.r".to_string()]);
+        assert_eq!(unmounted.load(Ordering::SeqCst), 1);
+        assert!(!reg.is_mounted("r.r"));
+        assert_eq!(
+            reg.pending_inject(),
+            vec![("r.r".to_string(), vec!["loop".to_string()])]
+        );
+
+        // 4) 服务回来 → 又挂上（这就是"依赖变更 → 插件重载"）。
+        let _keep = ctx.register::<u8>("loop", 2u8);
+        assert_eq!(reg.reconcile(&mctx).mounted, vec!["r.r".to_string()]);
+        assert_eq!(mounted.load(Ordering::SeqCst), 2);
+    }
+
+    /// reconcile **不会**顺手拉起"从没挂过也没 pending 记录"的插件，
+    /// 也不会动"人主动禁用"的插件。
+    #[test]
+    fn reconcile_does_not_touch_unrelated_or_disabled_plugins() {
+        use std::sync::atomic::Ordering;
+        let reg = PluginRegistry::new();
+        let mounted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let unmounted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        reg.register(needs_loop("q.never", mounted.clone(), unmounted.clone()))
+            .unwrap();
+        let ctx = Arc::new(echo_context::Ctx::default());
+        let _keep = ctx.register::<u8>("loop", 1u8);
+        let mctx = MountContext::new().with_ctx(ctx);
+
+        // 从没挂过、也没 pending 记录 → reconcile 不动它。
+        assert!(reg.reconcile(&mctx).is_noop());
+        assert_eq!(mounted.load(Ordering::SeqCst), 0);
+
+        // 人主动禁用 → 即便有 pending 记录也不挂。
+        assert!(reg.mount("q.never", &mctx).is_ok());
+        reg.unmount("q.never").unwrap();
+        reg.apply_disabled(&["q.never".to_string()]);
+        // 伪造 pending：手动制造"缺依赖失败"的状态再启用检查。
+        assert!(reg.reconcile(&mctx).is_noop());
+        assert_eq!(mounted.load(Ordering::SeqCst), 1);
+    }
+
+    /// 可选依赖（`Inject::optional`）不影响挂载，但会出现在 descriptor 里。
+    #[test]
+    fn optional_services_are_declared_but_never_block_mount() {
+        let reg = PluginRegistry::new();
+        let plugin = BuiltinPlugin::new(
+            PluginManifest::builtin("o.o", "o", "1", "tool", "", ""),
+            |_| Ok(vec![]),
+        )
+        .with_inject(crate::Inject::new(["loop"]).with_optional(["sanitizer", "extra"]));
+        reg.register(Arc::new(plugin)).unwrap();
+        let ctx = Arc::new(echo_context::Ctx::default());
+        let _keep = ctx.register::<u8>("loop", 1u8);
+        reg.mount("o.o", &MountContext::new().with_ctx(ctx))
+            .expect("optional 缺失不该阻止挂载");
+        let d = &reg.descriptors()[0];
+        assert_eq!(d.required_services, vec!["loop".to_string()]);
+        assert_eq!(
+            d.optional_services,
+            vec!["sanitizer".to_string(), "extra".to_string()]
+        );
+        assert!(d.pending_services.is_empty());
     }
 }

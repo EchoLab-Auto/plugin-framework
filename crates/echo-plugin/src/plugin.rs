@@ -36,6 +36,13 @@ pub struct MountContext {
     /// - 只读（`&self` 上的方法拿到的是 clone），插件改配置请走自己的
     ///   持久化面，别指望改这里能回写。
     pub config: serde_json::Value,
+    /// 插件树把手：本插件**挂在哪个作用域**里（`None` = 裸注册表，无树）。
+    ///
+    /// 有它时插件可以在自己的 `mount` 里 [`MountContext::nest`] 出一个子
+    /// 作用域，把子插件挂进去——卸载本插件时子作用域连带卸载（级联）。
+    /// 这是 dsh `ctx.plugin()` 嵌套的对应物；**框架不认识"子插件"这个业务
+    /// 概念**，只认"作用域归属"这一层结构。
+    pub tree: Option<Arc<crate::PluginScope>>,
 }
 
 impl MountContext {
@@ -62,6 +69,23 @@ impl MountContext {
     pub fn config_str(&self, key: &str) -> Option<&str> {
         self.config.get(key).and_then(|v| v.as_str())
     }
+    /// 附带插件树把手（`PluginScope::mount` 在挂载前注入）。
+    pub fn with_tree(mut self, tree: Arc<crate::PluginScope>) -> Self {
+        self.tree = Some(tree);
+        self
+    }
+    /// 本插件所在的作用域（裸注册表挂载时为 `None`）。
+    pub fn tree(&self) -> Option<&Arc<crate::PluginScope>> {
+        self.tree.as_ref()
+    }
+    /// 为**本插件**建一个子作用域（子插件挂这里）；无树可用时 `None`。
+    ///
+    /// 只在 `mount` 期间有效（作用域要知道当前挂载的是谁，才能把子作用域
+    /// 记在它名下、随它卸载而级联卸掉）。返回的作用域有独立的 `Ctx`
+    /// （父 = 本插件所在作用域的 ctx）与独立注册表。
+    pub fn nest(&self) -> Option<Arc<crate::PluginScope>> {
+        self.tree.as_ref()?.nest()
+    }
 }
 
 /// Mount error kinds.
@@ -87,6 +111,73 @@ pub enum PluginMountError {
 /// Result of a successful mount: disposers that undo the registration.
 pub type PluginMountResult = Result<Vec<Disposer>, PluginMountError>;
 
+/// 声明式依赖：本插件要用哪些服务键（dsh 的 `inject`）。
+///
+/// 两种语义，都由宿主实现：
+///
+/// - **required**（硬依赖）：挂载前必须都在。缺失 → 拒绝挂载
+///   （[`PluginMountError::MissingService`]，mount 闭包不执行）；
+/// - **optional**（软依赖）：有则用、无则降级，只作为**声明**记录下来
+///   （面板展示 / 宿主按需读），不参与挂载判定。
+///
+/// 为什么是服务键而不是类型：键的**存在性**是 `echo-context` 的概念，
+/// 键背后的类型是宿主与插件的私事。框架认类型就得认识宿主的 trait，
+/// `echo-plugin` 零领域依赖的边界立刻破掉（见 `framework-gates`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Inject {
+    /// 硬依赖：缺失即拒绝挂载。
+    pub required: Vec<String>,
+    /// 软依赖：仅声明（缺失不阻止挂载）。
+    pub optional: Vec<String>,
+}
+
+impl Inject {
+    /// 只要硬依赖。
+    pub fn new<I, S>(required: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            required: required.into_iter().map(Into::into).collect(),
+            optional: Vec::new(),
+        }
+    }
+
+    /// 追加软依赖。
+    pub fn with_optional<I, S>(mut self, optional: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.optional.extend(optional.into_iter().map(Into::into));
+        self
+    }
+
+    /// 硬依赖里当前**缺失**的键（`ctx` 为 `None` 时全部算缺失）。
+    pub fn missing(&self, ctx: Option<&Arc<echo_context::Ctx>>) -> Vec<String> {
+        match ctx {
+            Some(ctx) => self
+                .required
+                .iter()
+                .filter(|key| !ctx.contains(key))
+                .cloned()
+                .collect(),
+            None => self.required.clone(),
+        }
+    }
+
+    /// 硬依赖是否全部就绪。
+    pub fn is_ready(&self, ctx: Option<&Arc<echo_context::Ctx>>) -> bool {
+        self.missing(ctx).is_empty()
+    }
+
+    /// 是否什么都没声明。
+    pub fn is_empty(&self) -> bool {
+        self.required.is_empty() && self.optional.is_empty()
+    }
+}
+
 /// A mountable plugin.
 pub trait Plugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
@@ -100,20 +191,33 @@ pub trait Plugin: Send + Sync {
         Ok(())
     }
 
-    /// 本插件**要求的服务键**（`Ctx` 命名空间里的名字；默认空 = 无要求）。
+    /// 本插件的**声明式依赖**（服务键；默认空 = 无要求）。
     ///
-    /// 语义是「挂我之前，这些服务必须已经在 `Ctx` 里」——注册表在
-    /// [`PluginRegistry::mount`] 里逐个 `Ctx::contains` 校验，缺失即
-    /// [`PluginMountError::MissingService`]，插件**不会被挂载**。
+    /// 这是插件表达「我需要什么」的唯一声明面：
+    /// - [`PluginRegistry::mount`] 立即校验 required，缺失即
+    ///   [`PluginMountError::MissingService`]，**mount 闭包不执行**；
+    /// - [`PluginRegistry::mount_when_ready`] 先等它就绪（带超时）再挂；
+    /// - [`PluginRegistry::reconcile`] 在依赖变动后据此重挂 / 卸下。
     ///
     /// 为什么在框架层：服务键是 `echo-context` 的概念（字符串 + 存在性），
-    /// 不含任何应用领域词汇；而"依赖缺失就不启动"是插件机制的基本语义
-    /// （dsh 的 `inject`）。此前内联插件只能靠组合根手工编排启动顺序，
-    /// 顺序错了没有任何反馈——插件照样"挂载成功"，直到运行期才 NPE。
+    /// 不含任何应用领域词汇；"依赖没到就不启动、到了就启动"是插件机制的
+    /// 基本语义（dsh 的 `inject`）。此前内联插件只能靠组合根手工编排启动
+    /// 顺序，顺序错了毫无反馈——插件照样"挂载成功"，直到运行期才 NPE。
     ///
     /// [`PluginRegistry::mount`]: crate::PluginRegistry::mount
+    /// [`PluginRegistry::mount_when_ready`]: crate::PluginRegistry::mount_when_ready
+    /// [`PluginRegistry::reconcile`]: crate::PluginRegistry::reconcile
+    fn inject(&self) -> Inject {
+        Inject::default()
+    }
+
+    /// 硬依赖的键（[`Self::inject`] 的便捷读法：`self.inject().required`）。
+    ///
+    /// 保留它是**兼容 v0.5.0 的接缝**：那一版只有 `required_services`，
+    /// 现有实现覆写的是它。默认实现读 `inject().required`，所以两种写法
+    /// 都生效、且只有一个真值。
     fn required_services(&self) -> Vec<String> {
-        Vec::new()
+        self.inject().required
     }
 }
 
@@ -121,7 +225,7 @@ pub trait Plugin: Send + Sync {
 pub struct BuiltinPlugin {
     manifest: PluginManifest,
     mount_fn: Box<dyn Fn(&MountContext) -> PluginMountResult + Send + Sync>,
-    required_services: Vec<String>,
+    inject: Inject,
 }
 
 impl BuiltinPlugin {
@@ -132,18 +236,24 @@ impl BuiltinPlugin {
         Self {
             manifest,
             mount_fn: Box::new(mount_fn),
-            required_services: Vec::new(),
+            inject: Inject::default(),
         }
     }
 
-    /// 声明本插件要求的服务键（见 [`Plugin::required_services`]）。
-    pub fn with_required_services<I, S>(mut self, keys: I) -> Self
+    /// 声明本插件的依赖（见 [`Plugin::inject`]）：硬依赖 + 可选软依赖。
+    pub fn with_inject(mut self, inject: Inject) -> Self {
+        self.inject = inject;
+        self
+    }
+
+    /// 只声明硬依赖（**兼容 v0.5.0**：等价于
+    /// `with_inject(Inject::new(keys))`）。
+    pub fn with_required_services<I, S>(self, keys: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.required_services = keys.into_iter().map(Into::into).collect();
-        self
+        self.with_inject(Inject::new(keys))
     }
 }
 
@@ -156,7 +266,7 @@ impl Plugin for BuiltinPlugin {
         (self.mount_fn)(ctx)
     }
 
-    fn required_services(&self) -> Vec<String> {
-        self.required_services.clone()
+    fn inject(&self) -> Inject {
+        self.inject.clone()
     }
 }
