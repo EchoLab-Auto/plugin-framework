@@ -1,5 +1,6 @@
 //! Plugin trait — the mount/unmount lifecycle seam.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use echo_context::Disposer;
@@ -104,6 +105,56 @@ impl MountContext {
     /// 本插件的 id（裸用法下为空串）。
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
+    }
+
+    /// 从服务表解析一个**宿主提供的能力**（`None` = 没有或类型不符）。
+    ///
+    /// 这是"插件不捕获运行期句柄"的那把钥匙：`mount` 闭包不再需要宿主把
+    /// `Arc<dyn SomeHost>` 塞进构造参数，插件自己按**稳定的键**解析即可。
+    /// 于是组合根里的插件构造退化成 `plugin(version)`——目录只描述"有哪些
+    /// 插件"，不描述"它们各自需要哪些宿主的内部对象"。
+    ///
+    /// 与 [`Plugin::inject`] 的分工：`inject()` 是**声明**（注册表在跑 mount
+    /// 闭包之前校验，缺了就不执行），本方法是**取用**。两者应当读同一批键，
+    /// 但框架不做强制——声明是给编排与面板看的，取用是插件自己的事。
+    pub fn service<T: Any + Send + Sync + Clone>(
+        &self,
+        key: &echo_context::ServiceKey<T>,
+    ) -> Option<T> {
+        self.ctx.as_ref()?.service(key)
+    }
+
+    /// 同 [`Self::service`]，但缺失即**挂载失败**（`MissingService`）。
+    ///
+    /// 用它取代"宿主保证会传进来"的隐式契约：拿不到就报错，且错误里带着
+    /// `available` 全部键名——比 `expect("host not wired")` 有用得多。
+    pub fn require<T: Any + Send + Sync + Clone>(
+        &self,
+        key: &echo_context::ServiceKey<T>,
+    ) -> Result<T, PluginMountError> {
+        match &self.ctx {
+            Some(ctx) => ctx.require(key).map_err(|error| match error {
+                echo_context::ServiceError::Missing { key, available } => {
+                    PluginMountError::MissingService { key, available }
+                }
+                // `require` 只会回 Missing；其它情况保守地当缺服务处理。
+                other => PluginMountError::MissingService {
+                    key: other.to_string(),
+                    available: ctx.keys(),
+                },
+            }),
+            None => Err(PluginMountError::MissingService {
+                key: key.name().to_string(),
+                available: Vec::new(),
+            }),
+        }
+    }
+
+    /// 服务表本身（需要 `provide` 或做条件解析时用）。
+    ///
+    /// 裸注册表用法（单测）下为 `None`——调用方据此降级。
+    pub fn context(&self) -> Option<&Arc<echo_context::Ctx>> {
+        self.ctx.as_ref()
     }
 
     /// 为**本插件**建一个子作用域（子插件挂这里）；无树可用时 `None`。
@@ -589,5 +640,63 @@ impl Plugin for BuiltinPlugin {
 
     fn text_block_content(&self, key: &str, context: &serde_json::Value) -> Option<String> {
         self.text_content.as_ref()?(key, context)
+    }
+}
+
+#[cfg(test)]
+mod mount_context_service_tests {
+    use super::*;
+    use echo_context::{Ctx, ServiceKey};
+
+    static HOST: ServiceKey<Arc<dyn Fn() -> u32 + Send + Sync>> =
+        ServiceKey::new("test.host");
+
+    /// `require` 拿到宿主注册的能力——插件因此**不需要**构造参数。
+    ///
+    /// 这条是"插件零捕获"的地基：`mount` 闭包里能取到 `ctx` 注册的一切，
+    /// 于是组合根的 `plugin(version)` 签名可以不带任何 `Arc<dyn …>`。
+    #[test]
+    fn require_resolves_a_host_provided_capability() {
+        let ctx = Arc::new(Ctx::default());
+        let counter: Arc<dyn Fn() -> u32 + Send + Sync> = Arc::new(|| 7);
+        let _keep = ctx.provide(&HOST, counter);
+
+        let mctx = MountContext::new().with_ctx(ctx);
+        let resolved = mctx.require(&HOST).expect("宿主应已注册");
+        assert_eq!(resolved(), 7);
+    }
+
+    /// 缺失 → `MissingService`，且错误里带 `available`（排查用）。
+    #[test]
+    fn require_reports_missing_service_with_available_keys() {
+        let ctx = Arc::new(Ctx::default());
+        let _keep = ctx.provide(&HOST, Arc::new(|| 1u32) as Arc<dyn Fn() -> u32 + Send + Sync>);
+
+        let mctx = MountContext::new().with_ctx(ctx);
+        let error = mctx
+            .require(&ServiceKey::<u8>::new("test.absent"))
+            .expect_err("未注册的键必须失败");
+        match error {
+            PluginMountError::MissingService { key, available } => {
+                assert_eq!(key, "test.absent");
+                assert!(
+                    available.iter().any(|k| k == "test.host"),
+                    "available 应列出已有的键：{available:?}"
+                );
+            }
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    /// 没有服务表（裸注册表 / 单测）→ 也是 `MissingService`，不是 panic。
+    #[test]
+    fn require_without_a_context_fails_cleanly() {
+        let mctx = MountContext::new();
+        assert!(mctx.service(&HOST).is_none());
+        assert!(matches!(
+            mctx.require(&HOST),
+            Err(PluginMountError::MissingService { .. })
+        ));
+        assert!(mctx.context().is_none());
     }
 }

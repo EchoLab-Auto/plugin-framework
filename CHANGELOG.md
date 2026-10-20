@@ -4,6 +4,33 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.11.0] — 2026-11-21
+
+**插件零捕获**：`MountContext` 现在能自己解析宿主提供的能力，于是
+`mount` 闭包不必再捕获 `Arc<dyn SomeHost>` 这类运行期句柄，插件构造退化成
+`plugin(version)`。
+
+### 新增
+
+- `MountContext::service<T>(&ServiceKey<T>) -> Option<T>`：从服务表解析；
+- `MountContext::require<T>(&ServiceKey<T>) -> Result<T, PluginMountError>`：
+  缺失即挂载失败，错误带 `available` 全部键名；
+- `MountContext::context() -> Option<&Arc<Ctx>>`：需要 `provide` 或条件解析时
+  取服务表本身。
+
+### 为什么这属于框架
+
+「宿主把句柄塞进闭包」与「插件按键解析」是**同一件事的两种写法**，但后者
+让**目录**（谁存在）与**接线**（各自需要什么）解耦：组合根可以写
+`push(catalog, tools::plugin(version))`，把「哪个 trait 对象给哪个插件」交给
+服务表。这是 dsh `inject` 的**取用侧**——`inject()` 只声明，不取用。
+
+### 不变
+
+`MountContext` 的既有字段与构造方式一字未动（新方法都是附加的）。
+裸注册表（无 `Ctx`）语义不变：`service` 回 `None`、`require` 回
+`MissingService{available: []}`，不 panic。
+
 ## [0.10.0] — 2026-11-20
 
 **运行态上收**：把「宿主为了用这套框架而必须自己维护的状态」收进注册表。

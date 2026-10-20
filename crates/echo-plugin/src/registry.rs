@@ -232,8 +232,8 @@ pub struct PluginRegistry {
     /// 运行态：缓存的挂载上下文 / 事件订阅兴趣集 / 投递重入与计数。
     ///
     /// 这四样都与领域无关（任何宿主都要），此前由宿主包一层自己维护
-    /// （`echo-agent` 的 `PluginHost` 曾为此多出 ~150 行状态管理）。上收到
-    /// 注册表之后，宿主只剩领域翻译与配置格式。
+    /// （下游宿主的适配层曾为此多出约 150 行状态管理）。上收到注册表之后，
+    /// 宿主只剩领域翻译与配置格式。
     runtime: std::sync::Mutex<crate::runtime_state::RuntimeState>,
     /// 因**依赖未就绪**而没挂上的插件 → 当时缺的键。
     ///
@@ -270,8 +270,8 @@ impl PluginRegistry {
     /// [`Self::reconcile_cached`] 不必再让调用方传它。
     ///
     /// 为什么需要缓存：`MountContext` 里带服务表（`Ctx`）与事件出口，它们在
-    /// 进程寿命内是同一份；每次生命周期动作让调用方重复传，只会让宿主被迫
-    /// 自己存一份（`echo-agent` 的 `PluginHost` 曾经就是这么来的）。
+    /// 进程寿命内是同一份；每次生命周期动作让调用方重复传，只会让宿主的
+    /// 适配层被迫自己存一份（那是本方法存在之前的实际形状）。
     pub fn set_mount_ctx(&self, ctx: crate::MountContext) {
         self.runtime
             .lock()
