@@ -304,7 +304,11 @@ impl Ctx {
             }
             services.insert(key.name().to_string(), Box::new(service));
         }
-        self.ready.notify_waiters();
+        // 与 `register` 同款：广播给订阅者（父链向上传播）+ 唤醒等待者。
+        self.publish(Change::Provided {
+            key: key.name().to_string(),
+            depth: self.depth(),
+        });
         let ctx = self.clone();
         let name = key.name();
         Ok(Disposer::from_fn(move || ctx.remove_and_wake(name)))
@@ -929,5 +933,30 @@ mod tests {
             }
             other => panic!("expected Missing, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn typed_provide_broadcasts_like_register() {
+        use std::sync::Mutex;
+        static KEY: ServiceKey<u32> = ServiceKey::new("typed.port");
+        let root = Arc::new(Ctx::default());
+        let seen: Arc<Mutex<Vec<Change>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _sub = root.on_change(move |c| sink.lock().unwrap().push(c));
+        let keep = root.provide(&KEY, 1u8 as u32).expect("provide");
+        keep.dispose();
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                Change::Provided {
+                    key: "typed.port".into(),
+                    depth: 0
+                },
+                Change::Disposed {
+                    key: "typed.port".into(),
+                    depth: 0
+                },
+            ]
+        );
     }
 }
