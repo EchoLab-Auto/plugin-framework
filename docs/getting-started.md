@@ -134,11 +134,17 @@ let transport = StdioTransport::new("./plugin")
 ## 5. 跨语言插件
 
 协议就是 ABI：**4 字节小端 `u32` 长度前缀 + JSON**，走 stdin/stdout。任何语言写个
-循环就能当插件，不需要 Rust、不需要 SDK。帧格式与握手序列见
-[`echo-plugin-api`](../crates/echo-plugin-api) 的模块文档（`PROTOCOL_NAME` =
-`echo-plugin`，`PROTOCOL_VERSION` = 1）。
+循环就能当插件，不需要 Rust、不需要 SDK（`PROTOCOL_NAME` = `echo-plugin`，
+`PROTOCOL_VERSION` = 1）。
 
-这是这套框架相对 Node 生态插件框架的一个实质优势：**不锁定语言**。
+这不是说法而是能跑的事实：[`examples/minimal-plugin-py/plugin.py`](../examples/minimal-plugin-py/plugin.py)
+是一个纯 Python 插件，约 150 行、零 Rust 依赖，文件头把线上协议完整写了一遍
+（帧格式 / 握手顺序 / 消息形状 / 生命周期），可直接当别的语言的参考实现。
+`cargo test -p echo-plugin-host --test cross_language` 会真的 spawn 它并验证
+握手、贡献解析、调用往返、版本不兼容拒绝。
+
+这是这套框架相对 Node 生态插件框架的一个实质优势：**不锁定语言**——宿主是 Rust，
+插件可以是 Python / Go / Node / shell，因为边界只有管道上的字节。
 
 ## 版本与兼容
 

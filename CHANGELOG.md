@@ -4,6 +4,33 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.4.1] — 2026-10-19
+
+新增**跨语言插件示例与测试**——把「协议即 ABI」从说法变成可运行的事实。
+
+### 新增
+
+- `examples/minimal-plugin-py/plugin.py`：纯 Python 插件，约 150 行，**零 Rust
+  依赖**。手写帧（4 字节小端长度前缀 + JSON），不用 SDK。文件头把线上协议完整
+  写了一遍——帧格式、握手顺序（`Hello` → `Welcome` → `Register` → `Ready`）、
+  消息形状、生命周期（`drain` / `dispose` / `cancel` / stdin EOF），可直接当别的
+  语言的参考实现。
+- `crates/echo-plugin-host/tests/cross_language.rs`（3 项）：
+  - `python_plugin_speaks_the_protocol`：真 spawn Python 进程，验握手 + 贡献
+    解析 + 调用往返 + 未知贡献返回结构化错误 + drain 优雅退出
+  - `python_plugin_rejects_mismatched_protocol_version`：协议版本 999 必须被
+    拒绝（fail-closed），不是"先连上再说"
+  - `python_plugin_frames_parse_with_the_rust_types`：直接对帧做断言（不经
+    supervisor），便于区分"协议问题"与"监督逻辑问题"
+  - 环境无 `python3` 时**跳过而非失败**
+- CI 新增跨语言步骤。
+
+### 为什么值得一条测试
+
+「不锁定语言」是这套框架相对 Node 生态插件框架的实质优势，但写在文档里只是说法。
+Python 插件真发一遍帧，才算证据——顺带把 M4 修掉的 `ServiceContribution` 重复键
+bug 也纳入了回归：把 `service_kind` 改回 `kind`，两条测试立刻 FAILED（已实测）。
+
 ## [0.4.0] — 2026-10-19
 
 新增**可运行的证伪测试**（`examples/`）与第三方文档；顺手修掉一个从 P0 就存在的

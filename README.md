@@ -30,7 +30,10 @@ cargo build -p minimal-plugin && cargo run -p minimal-host
 ```
 
 `examples/minimal-host`（130 行）与 `examples/minimal-plugin`（70 行）只依赖
-框架六件套，**不引入** `echo-defs` / `echo-agent`。详见
+框架六件套，**不引入** `echo-defs` / `echo-agent`。
+
+跨语言也验过：`examples/minimal-plugin-py/plugin.py` 是纯 Python 插件，零 Rust
+依赖，由 `cargo test -p echo-plugin-host --test cross_language` 真跑。详见
 [examples/README.md](./examples/README.md) 与 [快速上手](./docs/getting-started.md)。
 
 **零全局态现在是无条件成立的**（v0.3.0）：原 `echo-context::kernel`（进程级

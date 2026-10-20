@@ -40,6 +40,12 @@ jobs:
           cargo build --locked -p minimal-plugin
           cargo run --locked -p minimal-host
 
+      # 跨语言：Python 插件手写帧，不碰 Rust。证明「协议即 ABI」。
+      - name: 跨语言插件（Python 走同一份协议）
+        run: |
+          python3 --version
+          cargo test --locked -p echo-plugin-host --test cross_language
+
       # clippy 只作为警告展示，不阻断（迁出期先让 CI 稳定；M4 收紧为 -D warnings）
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
