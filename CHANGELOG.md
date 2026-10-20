@@ -4,6 +4,38 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.2.0] — 2026-10-19
+
+迁入宿主侧四件套，**六件套齐备**——本仓现在可以独立跑通端到端插件链路。
+从 EchoAgentCore 逐字节搬迁，代码与行为零改动。
+
+### 新增
+
+- `echo-context` 0.1.0：`Ctx` 服务定位、强类型 `ServiceKey`、四模式 `EventBus`
+  （Observe / Waterfall / Parallel / Serial）、可逆注册 `Disposer`、
+  `ScopedRegistry`
+- `echo-plugin` 0.1.0：manifest + 生命周期 + registry。M2 已去业务化
+  ——`kind` 是开放标签（`String`），`MountContext` 只剩 `ctx`
+- `echo-plugin-loader` 0.1.0：profile → bundle → patch 三层配置合成 + provenance
+  + 依赖排序
+- `echo-plugin-host` 0.1.0：`Transport`（inproc / stdio）+ `PluginSupervisor`
+  （握手 / 调用 / 取消 / 排空 / 崩溃重启 / 资源限额）+ conformance 套件
+  （inproc 14 + stdio 10 + upgrade 10 + bootstrap 9 + host_call 3）
+- `framework-gates`：新增 `domain_agnostic` 门禁（4 项）
+
+### 变更
+
+- `no_global_state` 门禁改为**精确文件豁免**：`crates/echo-context/src/kernel.rs`
+  是宿主侧应用单例的收敛点（8 处调用全在应用层），终态应搬到宿主侧；白名单
+  数量被 `whitelist_stays_minimal` 锁死为 1，棘轮不松
+
+### 已知边界
+
+- 协议贡献类型仍带领域分类（`Contribution::Tool` / `Skill` / `PluginInstance`，
+  wire tag 保留历史名 `adapter`），去业务化排在 M5，需 2 个以上真实外部使用者
+  才启动
+- `echo-context::kernel` 的搬迁（见上）
+
 ## [0.1.1] — 2026-10-19
 
 只加**仓库自守门禁**，api / sdk 的代码与协议一字未改（无 API 变化）。
