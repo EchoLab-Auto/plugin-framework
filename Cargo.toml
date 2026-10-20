@@ -10,6 +10,9 @@ members = [
     "crates/echo-plugin-sdk",
     # 仓库自守门禁（只含 tests/，审计跨 crate 的仓库属性）
     "crates/framework-gates",
+    # 示例：证明框架可被任何 Rust 应用使用（M4 的证伪测试）
+    "examples/minimal-host",
+    "examples/minimal-plugin",
 ]
 
 [workspace.package]
@@ -35,6 +38,7 @@ thiserror = "2"
 
 # logging
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # misc
 async-trait = "0.1"

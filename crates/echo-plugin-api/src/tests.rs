@@ -305,3 +305,91 @@ fn contribution_shapes() {
     assert_eq!(minimal.category, "plugin");
     assert_eq!(minimal.parameters, json!(null));
 }
+
+/// **每个贡献变体都必须能过一遍 JSON**。
+///
+/// 回归背景（2026-10-19 M4 最小宿主撞出）：`ServiceContribution` 曾把载荷
+/// 字段也命名成 `kind`，而 `Contribution` 是内部标签枚举、tag 同为 `kind`——
+/// 序列化结果是 `{"kind":"service","key":"…","kind":"…"}`，**重复键**。
+/// 宿主侧 serde_json 报 `duplicate field`，整帧解析失败。
+///
+/// 为什么长期没被发现：inproc 轨类型直连、零序列化，这个冲突不出现；而当时
+/// 唯一声明 `Service` 贡献的插件跑在 inproc 上。直到有示例同时用
+/// 「Service 贡献 + stdio 轨」才暴露。
+///
+/// 这条测试把「所有变体都能过 JSON」变成硬约束，避免再出现某变体只在
+/// 单条轨上可用。
+#[test]
+fn every_contribution_variant_roundtrips_through_json() {
+    use crate::contribution::InstanceCapabilities;
+
+    let variants = vec![
+        Contribution::Tool(ToolContribution {
+            name: "bash".into(),
+            description: "run a command".into(),
+            parameters: json!({ "type": "object" }),
+            category: "builtin".into(),
+            timeout_hint_secs: Some(30),
+            package: Some("acme.pkg".into()),
+            visible_reply: true,
+        }),
+        Contribution::Skill(SkillContribution {
+            name: "deploy".into(),
+            description: "how to deploy".into(),
+            path: Some("/skills/deploy".into()),
+        }),
+        Contribution::Service(ServiceContribution {
+            key: "greeter".into(),
+            kind: "greeter".into(),
+            version: 3,
+        }),
+        Contribution::Events(EventContribution {
+            subscribe: vec!["tick".into(), "tock".into()],
+        }),
+        Contribution::PluginInstance(InstanceContribution {
+            name: "demo".into(),
+            platform: "demo".into(),
+            display_name: "Demo".into(),
+            capabilities: InstanceCapabilities::default(),
+            config_schema: None,
+            ui: None,
+            session_labels: None,
+            tools: vec![],
+        }),
+    ];
+
+    for contribution in variants {
+        let text = serde_json::to_string(&contribution)
+            .unwrap_or_else(|e| panic!("序列化失败 {contribution:?}: {e}"));
+        let back: Contribution = serde_json::from_str(&text).unwrap_or_else(|e| {
+            panic!("反序列化失败（wire 形状自相矛盾？）\n  json: {text}\n  err: {e}")
+        });
+        assert_eq!(contribution, back, "roundtrip 不一致：{text}");
+    }
+}
+
+/// `ServiceContribution` 的 wire 字段是 `service_kind`——与枚举 tag `kind` 不撞。
+#[test]
+fn service_contribution_wire_field_avoids_tag_collision() {
+    let service = Contribution::Service(ServiceContribution {
+        key: "greeter".into(),
+        kind: "greeter".into(),
+        version: 1,
+    });
+    let value = serde_json::to_value(&service).unwrap();
+    let object = value.as_object().expect("贡献应序列化为对象");
+
+    assert_eq!(object.get("kind").and_then(|v| v.as_str()), Some("service"));
+    assert_eq!(
+        object.get("service_kind").and_then(|v| v.as_str()),
+        Some("greeter"),
+        "载荷字段必须改名，否则与枚举 tag 重复"
+    );
+    // 兜底：序列化文本里 `"kind"` 只应出现一次（重复键会让宿主解析失败）。
+    let text = serde_json::to_string(&service).unwrap();
+    assert_eq!(
+        text.matches("\"kind\"").count(),
+        1,
+        "JSON 出现重复键：{text}"
+    );
+}

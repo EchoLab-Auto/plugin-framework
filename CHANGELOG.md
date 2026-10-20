@@ -4,6 +4,34 @@
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
 
+## [0.4.0] — 2026-10-19
+
+新增**可运行的证伪测试**（`examples/`）与第三方文档；顺手修掉一个从 P0 就存在的
+协议 bug。
+
+### 修复（真 bug）
+
+- **`Contribution::Service` 过不了 stdio 轨**：`Contribution` 是内部标签枚举、
+  tag 为 `kind`，而 `ServiceContribution` 的载荷字段也叫 `kind` → 序列化出
+  重复键 `{"kind":"service","key":"g","kind":"g","version":1}`，宿主
+  `serde_json` 报 `duplicate field`，整帧解析失败。
+  - 为什么长期未发现：inproc 轨类型直连、零序列化，冲突不出现；当时唯一声明
+    `Service` 贡献的插件跑在 inproc 上。M4 的最小示例（唯一同时用「Service
+    贡献 + stdio 轨」的组合）把它撞出来了。
+  - 修法：wire 字段改名 `service_kind`（此前这种帧**根本解析不了**，零兼容成本）。
+  - 防复发：新增 `every_contribution_variant_roundtrips_through_json`
+    （所有变体都过一遍 JSON）与 `service_contribution_wire_field_avoids_tag_collision`
+    （断言 JSON 里 `"kind"` 只出现一次）。
+
+### 新增
+
+- `examples/minimal-host`（130 行）+ `examples/minimal-plugin`（70 行）：
+  只用框架六件套的最小宿主与插件，**不引入** `echo-defs` / `echo-agent`。
+  宿主内部带 `assert!`，跑通即证明框架可独立使用；CI 里作为独立步骤执行。
+- `docs/getting-started.md`：第三方快速上手（写插件 / 拉起来 / 同进程轨 /
+  崩溃隔离 / 跨语言插件 / 版本策略）。
+- `examples/README.md`：预期输出与「每个示例在证明什么」。
+
 ## [0.3.0] — 2026-10-19
 
 **breaking**：移除 `echo_context::kernel`（进程级单例表，`pub mod kernel`）。

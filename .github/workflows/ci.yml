@@ -32,6 +32,14 @@ jobs:
       - name: 测试
         run: cargo test --workspace --locked
 
+      # 证伪测试：最小宿主 + 最小插件能否在**非本应用**的宿主里跑通。
+      # 先构建插件二进制（宿主会 spawn 它），再跑宿主；示例内部有 assert，
+      # 任何一步不对都非零退出。
+      - name: 示例端到端（框架可独立使用的证据）
+        run: |
+          cargo build --locked -p minimal-plugin
+          cargo run --locked -p minimal-host
+
       # clippy 只作为警告展示，不阻断（迁出期先让 CI 稳定；M4 收紧为 -D warnings）
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

@@ -19,8 +19,19 @@
 | [`framework-gates`](./crates/framework-gates) | 仓库自守门禁（不反向依赖宿主 / 零全局态 / 领域无关） |
 
 ```bash
-cargo test --workspace   # 165 项
+cargo test --workspace   # 162 项
 ```
+
+**它能被别的应用用吗？** 这是唯一有意义的问题，所以有一个可执行的证伪测试：
+
+```bash
+cargo build -p minimal-plugin && cargo run -p minimal-host
+# ✅ 全部断言通过——这套框架可以在非 EchoAgent 的宿主里独立使用
+```
+
+`examples/minimal-host`（130 行）与 `examples/minimal-plugin`（70 行）只依赖
+框架六件套，**不引入** `echo-defs` / `echo-agent`。详见
+[examples/README.md](./examples/README.md) 与 [快速上手](./docs/getting-started.md)。
 
 **零全局态现在是无条件成立的**（v0.3.0）：原 `echo-context::kernel`（进程级
 单例表）已搬到宿主侧。理由：使用者全在应用层（8 处），框架一处不用；框架导出

@@ -65,8 +65,25 @@ pub struct SkillContribution {
 pub struct ServiceContribution {
     /// 服务键（`Ctx` 命名空间；与 `ServiceKey::name()` 对应）。
     pub key: String,
-    /// 服务 kind 描述（文档 / 校验用，如 `"llm"` / `"loop"`）。
-    #[serde(default)]
+    /// 服务类别——**宿主自定义词汇**，框架只透传（如 `"greeter"` / `"loop"`）。
+    ///
+    /// **wire 名是 `service_kind`，不是 `kind`**：`Contribution` 是内部标签
+    /// 枚举且 tag 就叫 `kind`（`{"kind":"service", …}`），载荷字段若也叫 `kind`
+    /// 会序列化出**重复键**：
+    ///
+    /// ```text
+    /// {"kind":"service","key":"greeter","kind":"greeter","version":1}
+    ///                                          ^^^^ 重复
+    /// ```
+    ///
+    /// 宿主侧 `serde_json` 直接报 `duplicate field`，整帧解析失败。
+    ///
+    /// 这个 bug 在 **inproc 轨（类型直连、零序列化）完全不可见**——只有走
+    /// stdio 才暴露。2026-10-19 M4 的最小宿主示例（唯一一个同时用
+    /// `Service` 贡献 + stdio 轨的组合）把它撞了出来。
+    ///
+    /// 改名零兼容成本：此前这种帧**根本解析不了**，不可能有在用的一端。
+    #[serde(rename = "service_kind", default)]
     pub kind: String,
     /// 服务接口版本（消费端据此校验兼容）。
     #[serde(default)]
