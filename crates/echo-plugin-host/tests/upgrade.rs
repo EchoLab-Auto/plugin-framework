@@ -653,3 +653,88 @@ async fn upgrade_is_rejected_while_stopped() {
         .await
         .expect("drain ok");
 }
+
+/// 贡献集合随配置变化的对端：模拟新版插件增删/修改工具 schema。
+struct ChangingInstance;
+
+impl InprocPlugin for ChangingInstance {
+    fn run(self: Box<Self>, mut io: InprocIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            loop {
+                match io.recv().await {
+                    None => return,
+                    Some(HostToPlugin::Hello(hello)) => {
+                        let tool_name = hello
+                            .config
+                            .get("tool_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("echo")
+                            .to_string();
+                        let _ = io
+                            .send(PluginToHost::Welcome(Welcome {
+                                protocol: hello.protocol,
+                                version: hello.version,
+                                plugin_id: hello.plugin_id,
+                                capabilities: vec![capabilities::TOOLS.to_string()],
+                            }))
+                            .await;
+                        let _ = io
+                            .send(PluginToHost::Register(Register {
+                                contributions: vec![Contribution::Tool(ToolContribution {
+                                    name: tool_name.clone(),
+                                    description: "变化工具".to_string(),
+                                    parameters: json!({"type": "object"}),
+                                    category: "plugin".to_string(),
+                                    timeout_hint_secs: None,
+                                    package: None,
+                                    visible_reply: false,
+                                })],
+                            }))
+                            .await;
+                        let _ = io.send(PluginToHost::Ready).await;
+                    }
+                    Some(HostToPlugin::Invoke(inv)) => {
+                        let _ = io
+                            .send(PluginToHost::InvokeResult(InvokeResult {
+                                call_id: inv.call_id,
+                                outcome: InvokeOutcome::ok("old-instance"),
+                            }))
+                            .await;
+                    }
+                    Some(HostToPlugin::Drain(_)) => return,
+                    Some(_) => {}
+                }
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn contribution_change_is_rejected_before_traffic_switch() {
+    let transport = InprocTransport::new(|_spec: PluginSpec| -> Box<dyn InprocPlugin> {
+        Box::new(ChangingInstance)
+    });
+    let handle = start_plugin(Box::new(transport), json!({"tool_name": "echo"})).await;
+    let before = handle.contributions();
+
+    let error = handle
+        .upgrade_preserving_contributions(
+            json!({"tool_name": "new_tool"}),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("changed contributions must be rejected");
+    assert!(error.to_string().contains("contributions differ"), "{error}");
+    assert_eq!(handle.contributions(), before, "旧贡献必须保留");
+    assert_eq!(handle.hot_replaces(), 0, "不得发生流量切换");
+    assert_eq!(handle.state(), PluginState::Ready, "旧实例必须继续服务");
+    let outcome = handle.invoke("echo", ctx(5_000), json!({})).await;
+    assert_eq!(outcome, InvokeOutcome::ok("old-instance"));
+
+    handle
+        .upgrade_preserving_contributions(json!({"tool_name": "echo"}), Duration::from_secs(1))
+        .await
+        .expect("same contributions remain hot-upgradeable");
+    assert_eq!(handle.hot_replaces(), 1);
+    handle.drain(Duration::from_secs(1)).await.expect("drain");
+}

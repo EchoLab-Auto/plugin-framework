@@ -3,6 +3,13 @@
 本仓遵循 [语义化版本](https://semver.org/lang/zh-CN/)。0.x 期间允许 breaking，
 但每一处都记在这里。`PROTOCOL_VERSION` 是**线上契约**版本，与 crate 版本独立
 （判定规则见 [README](./README.md#版本与兼容)）。
+（判定规则见 [README](./README.md#版本与兼容)）。
+
+## [0.11.2] — 2026-11-28
+
+### 新增
+
+- `PluginHandle::upgrade_preserving_contributions`：面向“宿主在启动期物化贡献注册表”的兼容热替换。新实例握手后、流量切换前比对完整贡献集合；工具/schema/实例等贡献有任何变化即关闭 replacement、保留旧实例并返回明确错误，避免只换进程造成宿主注册表与插件能力漂移。
 
 ## [0.11.1] — 2026-11-21
 

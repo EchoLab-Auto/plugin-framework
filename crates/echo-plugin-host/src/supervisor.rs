@@ -462,6 +462,15 @@ impl PluginHandle {
     /// 监督任务已退出（如并发 drain 先完成）时返回非就绪错误。
     /// 并发 `upgrade` / `drain` 在监督循环内串行执行，按到达顺序处理。
     pub async fn upgrade(&self, config: Value, timeout: Duration) -> Result<(), TransportError> {
+        self.upgrade_inner(config, timeout, None).await
+    }
+
+    async fn upgrade_inner(
+        &self,
+        config: Value,
+        timeout: Duration,
+        expected_contributions: Option<Vec<Contribution>>,
+    ) -> Result<(), TransportError> {
         let state = self.shared.state();
         if state != PluginState::Ready {
             return Err(not_ready_error(&state));
@@ -473,6 +482,7 @@ impl PluginHandle {
             .send(Control::Upgrade {
                 config,
                 timeout,
+                expected_contributions,
                 ack: ack_tx,
             })
             .await
@@ -484,6 +494,20 @@ impl PluginHandle {
             Ok(res) => res,
             Err(_) => Err(self.upgrade_unavailable_error()),
         }
+    }
+
+    /// 热替换，但要求新实例的贡献集合与当前完全一致。
+    ///
+    /// 宿主若在启动期把贡献物化成注册表条目（工具/schema/实例描述），
+    /// 贡献变化就必须走宿主级重装配，不能只换子进程。本方法在新实例
+    /// 握手后、流量切换前 fail-closed；不兼容时旧实例持续服务。
+    pub async fn upgrade_preserving_contributions(
+        &self,
+        config: Value,
+        timeout: Duration,
+    ) -> Result<(), TransportError> {
+        self.upgrade_inner(config, timeout, Some(self.contributions()))
+            .await
     }
 
     /// 监督任务已退出 / 竞态下的非就绪错误（[`PluginHandle::upgrade`] 用）。
@@ -582,6 +606,7 @@ enum Control {
     Upgrade {
         config: Value,
         timeout: Duration,
+        expected_contributions: Option<Vec<Contribution>>,
         ack: oneshot::Sender<Result<(), TransportError>>,
     },
     /// **停止但保留监督任务**（可再 [`Control::Start`]）：排空后进入
@@ -1013,10 +1038,18 @@ async fn supervise(
             Step::Ctl(Some(Control::Upgrade {
                 config,
                 timeout,
+                expected_contributions,
                 ack,
             })) => {
-                let res =
-                    upgrade_instance(&shared, transport.as_ref(), &spec, config, timeout).await;
+                let res = upgrade_instance(
+                    &shared,
+                    transport.as_ref(),
+                    &spec,
+                    config,
+                    timeout,
+                    expected_contributions,
+                )
+                .await;
                 let _ = ack.send(res);
             }
             Step::Ctl(None) => {
@@ -1339,6 +1372,7 @@ async fn upgrade_instance(
     spec: &PluginSpec,
     config: Value,
     timeout: Duration,
+    expected_contributions: Option<Vec<Contribution>>,
 ) -> Result<(), TransportError> {
     let state = shared.state();
     if state != PluginState::Ready {
@@ -1387,6 +1421,19 @@ async fn upgrade_instance(
             return Err(e);
         }
     };
+
+    if let (Some(expected), Some(actual)) = (&expected_contributions, &contributions) {
+        if expected != actual {
+            tracing::warn!(
+                plugin = %shared.plugin_id,
+                "upgrade: replacement contributions changed; keeping current instance"
+            );
+            let _ = new_conn.shutdown(FAILED_INSTANCE_SHUTDOWN_GRACE).await;
+            return Err(TransportError::Protocol(
+                "replacement contributions differ; host-level reassembly is required".into(),
+            ));
+        }
+    }
 
     // 原子切换：invoke 自此走新实例；贡献集合同步为新实例注册
     // （新实例未发 Register 时保留现有集合）。
